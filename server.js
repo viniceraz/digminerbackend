@@ -28,8 +28,11 @@ const { ethers } = require('ethers');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.use(cors({
+    origin: ['https://digminer.xyz', 'https://www.digminer.xyz', 'http://localhost:5173', 'http://localhost:3000'],
+    methods: ['GET', 'POST'],
+}));
+app.use(express.json({ limit: '16kb' })); // cap request body size
 
 // Health — always up, shows which env vars are loaded
 app.get('/health', (_req, res) => res.json({ ok: true, env: ENV_STATUS, ts: new Date().toISOString() }));
@@ -126,6 +129,15 @@ function requireAdmin(req, res, next) {
 // ════════════════════════════════════════════
 
 const norm = w => w.toLowerCase();
+const isValidAddress = addr => typeof addr === 'string' && /^0x[0-9a-fA-F]{40}$/.test(addr);
+const isValidMinerId = id => Number.isInteger(id) && id > 0;
+
+// Nonce rate-limit: max 1 request per 15s per wallet (prevents nonce-stomping attacks)
+const nonceRateLimit = new Map(); // wallet → last request ts
+setInterval(() => {
+    const cutoff = Date.now() - 60_000;
+    for (const [k, ts] of nonceRateLimit) if (ts < cutoff) nonceRateLimit.delete(k);
+}, 60_000);
 const randBetween = (min, max) => Math.round((Math.random() * (max - min) + min) * 100) / 100;
 
 function rollRarity() {
@@ -523,7 +535,15 @@ async function startEventListener() {
 
 // Auth: issue a nonce for a wallet to sign
 app.get('/api/nonce/:wallet', (req, res) => {
-    const w = norm(req.params.wallet);
+    const raw = req.params.wallet;
+    if (!isValidAddress(raw)) return res.status(400).json({ error: 'Invalid wallet address' });
+    const w = norm(raw);
+
+    // Rate limit: 1 nonce per 15 seconds per wallet
+    const last = nonceRateLimit.get(w);
+    if (last && Date.now() - last < 15_000) return res.status(429).json({ error: 'Too many nonce requests — wait 15 seconds' });
+    nonceRateLimit.set(w, Date.now());
+
     const nonce = crypto.randomBytes(16).toString('hex');
     nonceStore.set(w, { nonce, expiresAt: Date.now() + NONCE_TTL_MS });
     const message = `DigMiner auth\nWallet: ${w}\nNonce: ${nonce}`;
@@ -535,6 +555,7 @@ app.post('/api/auth', (req, res) => {
     try {
         const { wallet, signature } = req.body;
         if (!wallet || !signature) return res.status(400).json({ error: 'wallet and signature required' });
+        if (!isValidAddress(wallet)) return res.status(400).json({ error: 'Invalid wallet address' });
         const w = norm(wallet);
         const stored = nonceStore.get(w);
         if (!stored || stored.expiresAt < Date.now()) return res.status(401).json({ error: 'Nonce expired — request a new one' });
@@ -662,7 +683,9 @@ app.post('/api/play/:minerId', checkMaintenance, requireAuth, async (req, res) =
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
-        const result = await startMining(wallet, parseInt(req.params.minerId));
+        const minerId = parseInt(req.params.minerId);
+        if (!isValidMinerId(minerId)) return res.status(400).json({ error: 'Invalid miner ID' });
+        const result = await startMining(wallet, minerId);
         if (result.error) return res.status(400).json(result);
         res.json(result);
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -673,7 +696,9 @@ app.post('/api/claim/:minerId', checkMaintenance, requireAuth, async (req, res) 
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
-        const result = await claimMiner(wallet, parseInt(req.params.minerId));
+        const minerId = parseInt(req.params.minerId);
+        if (!isValidMinerId(minerId)) return res.status(400).json({ error: 'Invalid miner ID' });
+        const result = await claimMiner(wallet, minerId);
         if (result.error) return res.status(400).json(result);
         res.json(result);
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -706,7 +731,9 @@ app.post('/api/repair/:minerId', checkMaintenance, requireAuth, async (req, res)
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
-        const result = await repairMiner(wallet, parseInt(req.params.minerId));
+        const minerId = parseInt(req.params.minerId);
+        if (!isValidMinerId(minerId)) return res.status(400).json({ error: 'Invalid miner ID' });
+        const result = await repairMiner(wallet, minerId);
         if (result.error) return res.status(400).json(result);
         res.json(result);
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -720,7 +747,9 @@ app.post('/api/withdraw', checkMaintenance, requireAuth, async (req, res) => {
         const w = norm(wallet);
         const { data: player } = await supabase.from('players').select('digcoin_balance, total_withdrawn_pathusd').eq('wallet', w).single();
         const amount = parseFloat(amountDigcoin);
-        if (amount <= 0 || amount > player.digcoin_balance) return res.status(400).json({ error: `Insufficient balance. Have ${player.digcoin_balance.toFixed(2)} DIGCOIN` });
+        const MIN_WITHDRAW = 100; // 1 pathUSD minimum
+        if (isNaN(amount) || amount < MIN_WITHDRAW) return res.status(400).json({ error: `Minimum withdrawal is ${MIN_WITHDRAW} DIGCOIN (1 pathUSD)` });
+        if (amount > player.digcoin_balance) return res.status(400).json({ error: `Insufficient balance. Have ${player.digcoin_balance.toFixed(2)} DIGCOIN` });
 
         // 24h cooldown per wallet
         const { data: lastWithdraw } = await supabase.from('withdrawals')
@@ -758,11 +787,12 @@ app.post('/api/withdraw', checkMaintenance, requireAuth, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// History
-app.get('/api/history/:wallet', async (req, res) => {
+// History — auth required so users can only see their own data
+app.get('/api/history/:wallet', requireAuth, async (req, res) => {
     try {
         const w = norm(req.params.wallet);
-        const limit = parseInt(req.query.limit) || 50;
+        if (req.authWallet !== w) return res.status(403).json({ error: 'Cannot view history of another wallet' });
+        const limit = Math.min(parseInt(req.query.limit) || 50, 100);
         const { data: plays } = await supabase.from('play_history').select('*').eq('wallet', w).order('played_at', { ascending: false }).limit(limit);
         const { data: deps } = await supabase.from('deposits').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(limit);
         const { data: withs } = await supabase.from('withdrawals').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(limit);
