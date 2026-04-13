@@ -18,6 +18,7 @@ const ENV_STATUS = {
     CHAIN_ID:            process.env.CHAIN_ID || '❌ MISSING',
     POOL_CONTRACT:       process.env.POOL_CONTRACT || '❌ MISSING',
     SIGNER_PRIVATE_KEY:  !!process.env.SIGNER_PRIVATE_KEY,
+    ADMIN_WALLET:        process.env.ADMIN_WALLET || '❌ MISSING',
 };
 console.log('[ENV CHECK]', JSON.stringify(ENV_STATUS));
 
@@ -54,6 +55,7 @@ const CONFIG = {
     SIGNER_PRIVATE_KEY: process.env.SIGNER_PRIVATE_KEY,
     CHAIN_ID: parseInt(process.env.CHAIN_ID || '1'),
 
+    ADMIN_WALLET: (process.env.ADMIN_WALLET || '').toLowerCase(),
     DIGCOIN_PER_PATHUSD: 100,
     BOX_PRICE_DIGCOIN: 300,        // 3 pathUSD
     BOX_BULK_QUANTITY: 10,
@@ -90,6 +92,14 @@ setInterval(() => {
     for (const [k, v] of sessionStore) if (v.expiresAt < now) sessionStore.delete(k);
 }, 60_000);
 
+// Maintenance mode (in-memory; resets on redeploy — intentional)
+let MAINTENANCE_MODE = false;
+
+function checkMaintenance(req, res, next) {
+    if (MAINTENANCE_MODE) return res.status(503).json({ error: '🔧 Game is under maintenance. Come back soon!' });
+    next();
+}
+
 function requireAuth(req, res, next) {
     const auth = req.headers.authorization;
     if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'Authentication required — connect your wallet in the app' });
@@ -101,6 +111,14 @@ function requireAuth(req, res, next) {
     if (bodyWallet && bodyWallet !== session.wallet) return res.status(403).json({ error: 'Wallet mismatch — token does not match requested wallet' });
     req.authWallet = session.wallet;
     next();
+}
+
+function requireAdmin(req, res, next) {
+    requireAuth(req, res, () => {
+        if (!CONFIG.ADMIN_WALLET) return res.status(403).json({ error: 'Admin wallet not configured on server' });
+        if (req.authWallet !== CONFIG.ADMIN_WALLET) return res.status(403).json({ error: 'Forbidden — admin only' });
+        next();
+    });
 }
 
 // ════════════════════════════════════════════
@@ -597,7 +615,7 @@ app.post('/api/register', async (req, res) => {
 });
 
 // Deposit — requires txHash and verifies on-chain before crediting
-app.post('/api/deposit', requireAuth, async (req, res) => {
+app.post('/api/deposit', checkMaintenance, requireAuth, async (req, res) => {
     try {
         const { wallet, amountPathUSD, txHash } = req.body;
         if (!wallet || !amountPathUSD) return res.status(400).json({ error: 'wallet and amountPathUSD required' });
@@ -628,7 +646,7 @@ app.post('/api/deposit', requireAuth, async (req, res) => {
 });
 
 // Buy Box (1 or 10)
-app.post('/api/box/buy', requireAuth, async (req, res) => {
+app.post('/api/box/buy', checkMaintenance, requireAuth, async (req, res) => {
     try {
         const { wallet, quantity } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
@@ -640,7 +658,7 @@ app.post('/api/box/buy', requireAuth, async (req, res) => {
 });
 
 // Mine single miner (idle → start 24h cycle)
-app.post('/api/play/:minerId', requireAuth, async (req, res) => {
+app.post('/api/play/:minerId', checkMaintenance, requireAuth, async (req, res) => {
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
@@ -651,7 +669,7 @@ app.post('/api/play/:minerId', requireAuth, async (req, res) => {
 });
 
 // Claim single miner (ready → collect reward → back to idle)
-app.post('/api/claim/:minerId', requireAuth, async (req, res) => {
+app.post('/api/claim/:minerId', checkMaintenance, requireAuth, async (req, res) => {
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
@@ -662,7 +680,7 @@ app.post('/api/claim/:minerId', requireAuth, async (req, res) => {
 });
 
 // Play All: start all idle miners (fee per miner)
-app.post('/api/play-all', requireAuth, async (req, res) => {
+app.post('/api/play-all', checkMaintenance, requireAuth, async (req, res) => {
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
@@ -673,7 +691,7 @@ app.post('/api/play-all', requireAuth, async (req, res) => {
 });
 
 // Claim All: collect from all ready miners (fee per miner)
-app.post('/api/claim-all', requireAuth, async (req, res) => {
+app.post('/api/claim-all', checkMaintenance, requireAuth, async (req, res) => {
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
@@ -684,7 +702,7 @@ app.post('/api/claim-all', requireAuth, async (req, res) => {
 });
 
 // Repair
-app.post('/api/repair/:minerId', requireAuth, async (req, res) => {
+app.post('/api/repair/:minerId', checkMaintenance, requireAuth, async (req, res) => {
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
@@ -695,7 +713,7 @@ app.post('/api/repair/:minerId', requireAuth, async (req, res) => {
 });
 
 // Withdraw
-app.post('/api/withdraw', requireAuth, async (req, res) => {
+app.post('/api/withdraw', checkMaintenance, requireAuth, async (req, res) => {
     try {
         const { wallet, amountDigcoin } = req.body;
         if (!wallet || !amountDigcoin) return res.status(400).json({ error: 'wallet and amountDigcoin required' });
@@ -758,6 +776,60 @@ app.get('/api/history/:wallet', async (req, res) => {
         ].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, limit);
 
         res.json({ transactions: txs });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ════════════════════════════════════════════
+// ADMIN ROUTES
+// ════════════════════════════════════════════
+
+// Check if current session is admin (used by frontend to show/hide panel)
+app.get('/api/admin/status', requireAdmin, (_req, res) => {
+    res.json({ isAdmin: true, maintenance: MAINTENANCE_MODE, adminWallet: CONFIG.ADMIN_WALLET });
+});
+
+// Toggle maintenance mode
+app.post('/api/admin/maintenance', requireAdmin, (req, res) => {
+    const { enabled } = req.body;
+    MAINTENANCE_MODE = !!enabled;
+    console.log(`👑 [ADMIN] Maintenance mode → ${MAINTENANCE_MODE}`);
+    res.json({ success: true, maintenance: MAINTENANCE_MODE });
+});
+
+// Send DIGCOIN to any wallet (for giveaways, influencers, payments)
+app.post('/api/admin/send-digcoin', requireAdmin, async (req, res) => {
+    try {
+        const { toWallet, amount, reason } = req.body;
+        if (!toWallet || !amount) return res.status(400).json({ error: 'toWallet and amount required' });
+        const amt = parseFloat(amount);
+        if (amt <= 0 || isNaN(amt)) return res.status(400).json({ error: 'Amount must be a positive number' });
+        const w = norm(toWallet);
+        if (!/^0x[0-9a-f]{40}$/.test(w)) return res.status(400).json({ error: 'Invalid wallet address' });
+
+        const player = await getOrCreatePlayer(w);
+        await supabase.from('players')
+            .update({ digcoin_balance: player.digcoin_balance + amt })
+            .eq('wallet', w);
+
+        // Log as a deposit with tx_hash starting with "admin_" so it never double-credits
+        await supabase.from('deposits').insert({
+            wallet: w, amount_pathusd: 0, digcoin_credited: amt,
+            tx_hash: `admin_${Date.now()}_${(reason || 'gift').replace(/\s+/g, '_').slice(0, 40)}`,
+        });
+
+        console.log(`👑 [ADMIN] Sent ${amt} DIGCOIN → ${w} (reason: ${reason || 'gift'})`);
+        res.json({ success: true, wallet: w, amountSent: amt, newBalance: player.digcoin_balance + amt, reason: reason || 'gift' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// List players (admin view — wallet + balance + miner count)
+app.get('/api/admin/players', requireAdmin, async (req, res) => {
+    try {
+        const { data: players } = await supabase.from('players')
+            .select('wallet, digcoin_balance, total_deposited_pathusd, total_earned_digcoin, boxes_bought, created_at')
+            .order('digcoin_balance', { ascending: false })
+            .limit(100);
+        res.json({ players: players || [] });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
