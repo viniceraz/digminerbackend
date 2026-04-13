@@ -8,6 +8,7 @@
  */
 
 try { require('dotenv').config(); } catch(e) {}
+const crypto = require('crypto');
 
 // Startup env check
 const ENV_STATUS = {
@@ -72,6 +73,35 @@ const CONFIG = {
         { id: 5, name: 'Mythic',     chance: 2,  dailyMin: 36, dailyMax: 42, nftAge: 70, repairPathUSD: 1.50, color: '#9C27B0' },
     ],
 };
+
+// ════════════════════════════════════════════
+// AUTH (EIP-191 wallet signatures)
+// ════════════════════════════════════════════
+
+const nonceStore   = new Map(); // wallet  → { nonce, expiresAt }
+const sessionStore = new Map(); // token   → { wallet, expiresAt }
+const NONCE_TTL_MS   = 5  * 60 * 1000;      // 5 min
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 h
+
+// Clean up expired entries every minute
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of nonceStore)   if (v.expiresAt < now) nonceStore.delete(k);
+    for (const [k, v] of sessionStore) if (v.expiresAt < now) sessionStore.delete(k);
+}, 60_000);
+
+function requireAuth(req, res, next) {
+    const auth = req.headers.authorization;
+    if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'Authentication required — connect your wallet in the app' });
+    const token = auth.slice(7);
+    const session = sessionStore.get(token);
+    if (!session || session.expiresAt < Date.now()) return res.status(401).json({ error: 'Session expired — reconnect your wallet' });
+    // If the body has a wallet field, make sure it matches the session
+    const bodyWallet = req.body.wallet ? norm(req.body.wallet) : null;
+    if (bodyWallet && bodyWallet !== session.wallet) return res.status(403).json({ error: 'Wallet mismatch — token does not match requested wallet' });
+    req.authWallet = session.wallet;
+    next();
+}
 
 // ════════════════════════════════════════════
 // HELPERS
@@ -473,6 +503,34 @@ async function startEventListener() {
 // API ROUTES
 // ════════════════════════════════════════════
 
+// Auth: issue a nonce for a wallet to sign
+app.get('/api/nonce/:wallet', (req, res) => {
+    const w = norm(req.params.wallet);
+    const nonce = crypto.randomBytes(16).toString('hex');
+    nonceStore.set(w, { nonce, expiresAt: Date.now() + NONCE_TTL_MS });
+    const message = `DigMiner auth\nWallet: ${w}\nNonce: ${nonce}`;
+    res.json({ nonce, message });
+});
+
+// Auth: verify signed nonce → return session token (valid 24 h)
+app.post('/api/auth', (req, res) => {
+    try {
+        const { wallet, signature } = req.body;
+        if (!wallet || !signature) return res.status(400).json({ error: 'wallet and signature required' });
+        const w = norm(wallet);
+        const stored = nonceStore.get(w);
+        if (!stored || stored.expiresAt < Date.now()) return res.status(401).json({ error: 'Nonce expired — request a new one' });
+        const message = `DigMiner auth\nWallet: ${w}\nNonce: ${stored.nonce}`;
+        let recovered;
+        try { recovered = ethers.verifyMessage(message, signature).toLowerCase(); } catch (_) { return res.status(401).json({ error: 'Invalid signature' }); }
+        if (recovered !== w) return res.status(401).json({ error: 'Signature does not match wallet' });
+        nonceStore.delete(w); // one-time use
+        const token = crypto.randomBytes(32).toString('hex');
+        sessionStore.set(token, { wallet: w, expiresAt: Date.now() + SESSION_TTL_MS });
+        res.json({ success: true, token, expiresIn: SESSION_TTL_MS });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Player info
 app.get('/api/player/:wallet', async (req, res) => {
     try {
@@ -539,7 +597,7 @@ app.post('/api/register', async (req, res) => {
 });
 
 // Deposit — requires txHash and verifies on-chain before crediting
-app.post('/api/deposit', async (req, res) => {
+app.post('/api/deposit', requireAuth, async (req, res) => {
     try {
         const { wallet, amountPathUSD, txHash } = req.body;
         if (!wallet || !amountPathUSD) return res.status(400).json({ error: 'wallet and amountPathUSD required' });
@@ -570,7 +628,7 @@ app.post('/api/deposit', async (req, res) => {
 });
 
 // Buy Box (1 or 10)
-app.post('/api/box/buy', async (req, res) => {
+app.post('/api/box/buy', requireAuth, async (req, res) => {
     try {
         const { wallet, quantity } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
@@ -582,7 +640,7 @@ app.post('/api/box/buy', async (req, res) => {
 });
 
 // Mine single miner (idle → start 24h cycle)
-app.post('/api/play/:minerId', async (req, res) => {
+app.post('/api/play/:minerId', requireAuth, async (req, res) => {
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
@@ -593,7 +651,7 @@ app.post('/api/play/:minerId', async (req, res) => {
 });
 
 // Claim single miner (ready → collect reward → back to idle)
-app.post('/api/claim/:minerId', async (req, res) => {
+app.post('/api/claim/:minerId', requireAuth, async (req, res) => {
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
@@ -604,7 +662,7 @@ app.post('/api/claim/:minerId', async (req, res) => {
 });
 
 // Play All: start all idle miners (fee per miner)
-app.post('/api/play-all', async (req, res) => {
+app.post('/api/play-all', requireAuth, async (req, res) => {
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
@@ -615,7 +673,7 @@ app.post('/api/play-all', async (req, res) => {
 });
 
 // Claim All: collect from all ready miners (fee per miner)
-app.post('/api/claim-all', async (req, res) => {
+app.post('/api/claim-all', requireAuth, async (req, res) => {
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
@@ -626,7 +684,7 @@ app.post('/api/claim-all', async (req, res) => {
 });
 
 // Repair
-app.post('/api/repair/:minerId', async (req, res) => {
+app.post('/api/repair/:minerId', requireAuth, async (req, res) => {
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
@@ -637,7 +695,7 @@ app.post('/api/repair/:minerId', async (req, res) => {
 });
 
 // Withdraw
-app.post('/api/withdraw', async (req, res) => {
+app.post('/api/withdraw', requireAuth, async (req, res) => {
     try {
         const { wallet, amountDigcoin } = req.body;
         if (!wallet || !amountDigcoin) return res.status(400).json({ error: 'wallet and amountDigcoin required' });
