@@ -7,7 +7,21 @@
  * DIGCOIN = offchain currency (100 DIGCOIN = 1 pathUSD)
  */
 
-require('dotenv').config();
+try { require('dotenv').config(); } catch(e) {}
+
+// Startup env check — helps debug Railway / production issues
+console.log('[ENV] SUPABASE_URL:', process.env.SUPABASE_URL ? '✅ set' : '❌ MISSING');
+console.log('[ENV] SUPABASE_SERVICE_KEY:', process.env.SUPABASE_SERVICE_KEY ? '✅ set' : '❌ MISSING');
+console.log('[ENV] RPC_URL:', process.env.RPC_URL || '❌ MISSING');
+console.log('[ENV] CHAIN_ID:', process.env.CHAIN_ID || '❌ MISSING');
+console.log('[ENV] POOL_CONTRACT:', process.env.POOL_CONTRACT || '❌ MISSING');
+console.log('[ENV] SIGNER_PRIVATE_KEY:', process.env.SIGNER_PRIVATE_KEY ? '✅ set' : '❌ MISSING');
+
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
+    console.error('\n❌ FATAL: Supabase env vars missing. Set SUPABASE_URL and SUPABASE_SERVICE_KEY in Railway Variables.\n');
+    process.exit(1);
+}
+
 const express = require('express');
 const cors = require('cors');
 const { ethers } = require('ethers');
