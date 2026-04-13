@@ -29,6 +29,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { rateLimit } = require('express-rate-limit');
 
 const app = express();
+app.set('trust proxy', 1); // Trust Railway/Vercel proxy so rate-limit sees real client IPs
 app.use(cors({
     origin: ['https://digminer.xyz', 'https://www.digminer.xyz', 'http://localhost:5173', 'http://localhost:3000'],
     methods: ['GET', 'POST'],
@@ -263,24 +264,37 @@ async function buyBoxes(wallet, quantity = 1) {
     if (!deducted?.length) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
 
     const miners = [];
-    for (let i = 0; i < quantity; i++) {
-        const rarity = rollRarity();
-        const dailyDigcoin = randBetween(rarity.dailyMin, rarity.dailyMax);
-        const stats = generateStats(rarity);
+    try {
+        for (let i = 0; i < quantity; i++) {
+            const rarity = rollRarity();
+            const dailyDigcoin = randBetween(rarity.dailyMin, rarity.dailyMax);
+            const stats = generateStats(rarity);
 
-        const { data: miner } = await supabase.from('miners').insert({
-            wallet: w, rarity_id: rarity.id, rarity_name: rarity.name,
-            daily_digcoin: dailyDigcoin, nft_age_total: rarity.nftAge, nft_age_remaining: rarity.nftAge,
-            ...stats,
-        }).select().single();
+            const { data: miner, error: minerErr } = await supabase.from('miners').insert({
+                wallet: w, rarity_id: rarity.id, rarity_name: rarity.name,
+                daily_digcoin: dailyDigcoin, nft_age_total: rarity.nftAge, nft_age_remaining: rarity.nftAge,
+                ...stats,
+            }).select().single();
 
-        await supabase.from('box_purchases').insert({ wallet: w, miner_id: miner.id, cost_digcoin: CONFIG.BOX_PRICE_DIGCOIN });
+            if (minerErr || !miner) throw new Error(minerErr?.message || 'Failed to create miner');
 
-        miners.push({
-            id: miner.id, rarityId: rarity.id, rarityName: rarity.name,
-            dailyDigcoin, nftAge: rarity.nftAge, color: rarity.color, ...stats,
-            roi: Math.ceil(CONFIG.BOX_PRICE_DIGCOIN / dailyDigcoin),
-        });
+            await supabase.from('box_purchases').insert({ wallet: w, miner_id: miner.id, cost_digcoin: CONFIG.BOX_PRICE_DIGCOIN });
+
+            miners.push({
+                id: miner.id, rarityId: rarity.id, rarityName: rarity.name,
+                dailyDigcoin, nftAge: rarity.nftAge, color: rarity.color, ...stats,
+                roi: Math.ceil(CONFIG.BOX_PRICE_DIGCOIN / dailyDigcoin),
+            });
+        }
+    } catch (insertErr) {
+        // Rollback: restore balance since miners were not all created
+        await supabase.from('players').update({
+            digcoin_balance: player.digcoin_balance,
+            total_spent_digcoin: player.total_spent_digcoin,
+            boxes_bought: player.boxes_bought,
+        }).eq('wallet', w);
+        console.error(`❌ buyBoxes insert failed for ${w}, balance restored:`, insertErr.message);
+        return { error: 'Failed to open box — balance restored, please try again' };
     }
 
     return { success: true, miners, cost, discount: quantity === CONFIG.BOX_BULK_QUANTITY ? '5%' : null };
@@ -330,14 +344,20 @@ async function claimMiner(wallet, minerId) {
     const newAge = miner.nft_age_remaining - 1;
     const isDead = newAge <= 0;
 
-    // After claiming → back to idle (last_play_at = null), player must Mine again
-    await supabase.from('miners').update({
-        nft_age_remaining: newAge, is_alive: !isDead, needs_repair: isDead,
-        last_play_at: null, exp: miner.exp + Math.floor(reward),
-    }).eq('id', minerId);
+    // Atomic miner state transition: only succeeds if last_play_at is still set.
+    // This prevents double-claim from concurrent requests (second update finds last_play_at=null → 0 rows → rejected).
+    const { data: minerUpdated } = await supabase.from('miners')
+        .update({
+            nft_age_remaining: newAge, is_alive: !isDead, needs_repair: isDead,
+            last_play_at: null, exp: miner.exp + Math.floor(reward),
+        })
+        .eq('id', minerId)
+        .not('last_play_at', 'is', null) // guard: only claim if still in mining state
+        .select('id');
 
-    // Use Supabase RPC-style update — for credits (additions) a simple update is safe since
-    // we are adding, not subtracting. We still re-read to get fresh balance.
+    if (!minerUpdated?.length) return { error: 'Reward already claimed (concurrent request)' };
+
+    // Credit player. Re-read fresh balance to avoid stale-read race on additions.
     const { data: player } = await supabase.from('players').select('digcoin_balance, total_earned_digcoin').eq('wallet', w).single();
     await supabase.from('players').update({
         digcoin_balance: player.digcoin_balance + reward,
@@ -415,7 +435,7 @@ async function claimAll(wallet) {
 
     if (!feeDeducted?.length) return { error: 'Insufficient balance for Claim All fee (concurrent update conflict — try again)' };
 
-    let totalReward = 0, claimed = 0, died = 0;
+    let totalReward = 0, claimed = 0, died = 0, failed = 0;
     const details = [];
 
     for (const miner of ready) {
@@ -424,15 +444,28 @@ async function claimAll(wallet) {
             totalReward += result.reward;
             claimed++;
             if (result.minerDead) died++;
+        } else {
+            failed++;
         }
         details.push({ minerId: miner.id, rarityName: miner.rarity_name, ...result });
     }
 
+    // Refund fee for any miners that couldn't be claimed (e.g., claimed concurrently by another request)
+    const actualFee = CONFIG.PLAY_ALL_FEE_DIGCOIN * claimed;
+    const refund = totalFee - actualFee;
+    if (refund > 0) {
+        const { data: fp } = await supabase.from('players').select('digcoin_balance, total_spent_digcoin').eq('wallet', w).single();
+        await supabase.from('players').update({
+            digcoin_balance: fp.digcoin_balance + refund,
+            total_spent_digcoin: Math.max(0, (fp.total_spent_digcoin || 0) - refund),
+        }).eq('wallet', w);
+    }
+
     return {
         totalReward: Math.round(totalReward * 100) / 100,
-        claimAllFee: totalFee,
-        netReward: Math.round((totalReward - totalFee) * 100) / 100,
-        claimed, died, details,
+        claimAllFee: actualFee,
+        netReward: Math.round((totalReward - actualFee) * 100) / 100,
+        claimed, died, failed, details,
     };
 }
 
@@ -590,11 +623,14 @@ app.post('/api/auth', (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Player info
+// Player info — read-only, does NOT create accounts (creation happens via /api/register)
 app.get('/api/player/:wallet', async (req, res) => {
     try {
-        const w = norm(req.params.wallet);
-        const player = await getOrCreatePlayer(w);
+        const raw = req.params.wallet;
+        if (!isValidAddress(raw)) return res.status(400).json({ error: 'Invalid wallet address' });
+        const w = norm(raw);
+        const { data: player } = await supabase.from('players').select('*').eq('wallet', w).single();
+        if (!player) return res.status(404).json({ error: 'Player not found' });
         const { data: miners } = await supabase.from('miners').select('*').eq('wallet', w).order('created_at', { ascending: false });
 
         const now = Date.now();
@@ -645,11 +681,13 @@ app.get('/api/player/:wallet', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Register with referral
-app.post('/api/register', async (req, res) => {
+// Register with referral (called on first connect to attach referrer)
+app.post('/api/register', requireAuth, async (req, res) => {
     try {
         const { wallet, referrer } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
+        if (!isValidAddress(wallet)) return res.status(400).json({ error: 'Invalid wallet address' });
+        if (referrer && !isValidAddress(referrer)) return res.status(400).json({ error: 'Invalid referrer address' });
         const player = await getOrCreatePlayer(wallet, referrer);
         res.json({ success: true, player });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -699,7 +737,7 @@ app.post('/api/box/buy', financialLimit, checkMaintenance, requireAuth, async (r
 });
 
 // Mine single miner (idle → start 24h cycle)
-app.post('/api/play/:minerId', checkMaintenance, requireAuth, async (req, res) => {
+app.post('/api/play/:minerId', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
@@ -712,7 +750,7 @@ app.post('/api/play/:minerId', checkMaintenance, requireAuth, async (req, res) =
 });
 
 // Claim single miner (ready → collect reward → back to idle)
-app.post('/api/claim/:minerId', checkMaintenance, requireAuth, async (req, res) => {
+app.post('/api/claim/:minerId', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
@@ -725,7 +763,7 @@ app.post('/api/claim/:minerId', checkMaintenance, requireAuth, async (req, res) 
 });
 
 // Play All: start all idle miners (fee per miner)
-app.post('/api/play-all', checkMaintenance, requireAuth, async (req, res) => {
+app.post('/api/play-all', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
@@ -736,7 +774,7 @@ app.post('/api/play-all', checkMaintenance, requireAuth, async (req, res) => {
 });
 
 // Claim All: collect from all ready miners (fee per miner)
-app.post('/api/claim-all', checkMaintenance, requireAuth, async (req, res) => {
+app.post('/api/claim-all', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
@@ -747,7 +785,7 @@ app.post('/api/claim-all', checkMaintenance, requireAuth, async (req, res) => {
 });
 
 // Repair
-app.post('/api/repair/:minerId', checkMaintenance, requireAuth, async (req, res) => {
+app.post('/api/repair/:minerId', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
     try {
         const { wallet } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
