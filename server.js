@@ -169,6 +169,19 @@ async function buyBoxes(wallet, quantity = 1) {
         return { error: `Insufficient balance. Need ${cost} DIGCOIN (have ${player.digcoin_balance.toFixed(2)})` };
     }
 
+    // Atomic deduction: only succeeds if balance is still >= cost at write time
+    const { data: deducted } = await supabase.from('players')
+        .update({
+            digcoin_balance: player.digcoin_balance - cost,
+            total_spent_digcoin: player.total_spent_digcoin + cost,
+            boxes_bought: player.boxes_bought + quantity,
+        })
+        .eq('wallet', w)
+        .gte('digcoin_balance', cost)
+        .select('digcoin_balance');
+
+    if (!deducted?.length) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
+
     const miners = [];
     for (let i = 0; i < quantity; i++) {
         const rarity = rollRarity();
@@ -189,12 +202,6 @@ async function buyBoxes(wallet, quantity = 1) {
             roi: Math.ceil(CONFIG.BOX_PRICE_DIGCOIN / dailyDigcoin),
         });
     }
-
-    await supabase.from('players').update({
-        digcoin_balance: player.digcoin_balance - cost,
-        total_spent_digcoin: player.total_spent_digcoin + cost,
-        boxes_bought: player.boxes_bought + quantity,
-    }).eq('wallet', w);
 
     return { success: true, miners, cost, discount: quantity === CONFIG.BOX_BULK_QUANTITY ? '5%' : null };
 }
@@ -249,10 +256,12 @@ async function claimMiner(wallet, minerId) {
         last_play_at: null, exp: miner.exp + Math.floor(reward),
     }).eq('id', minerId);
 
+    // Use Supabase RPC-style update — for credits (additions) a simple update is safe since
+    // we are adding, not subtracting. We still re-read to get fresh balance.
     const { data: player } = await supabase.from('players').select('digcoin_balance, total_earned_digcoin').eq('wallet', w).single();
     await supabase.from('players').update({
         digcoin_balance: player.digcoin_balance + reward,
-        total_earned_digcoin: player.total_earned_digcoin + reward,
+        total_earned_digcoin: (player.total_earned_digcoin || 0) + reward,
     }).eq('wallet', w);
 
     await supabase.from('play_history').insert({ wallet: w, miner_id: minerId, reward_digcoin: reward });
@@ -275,14 +284,21 @@ async function playAll(wallet) {
         return { error: `Insufficient balance. Need ${totalFee} DIGCOIN (${CONFIG.PLAY_ALL_FEE_DIGCOIN} per miner × ${miners.length} miners)` };
     }
 
+    // Atomic deduction: only succeeds if balance is still >= fee at write time
+    const { data: deducted } = await supabase.from('players')
+        .update({
+            digcoin_balance: player.digcoin_balance - totalFee,
+            total_spent_digcoin: (player.total_spent_digcoin || 0) + totalFee,
+        })
+        .eq('wallet', w)
+        .gte('digcoin_balance', totalFee)
+        .select('digcoin_balance');
+
+    if (!deducted?.length) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
+
     const now = new Date().toISOString();
     const ids = miners.map(m => m.id);
     await supabase.from('miners').update({ last_play_at: now }).in('id', ids);
-
-    await supabase.from('players').update({
-        digcoin_balance: player.digcoin_balance - totalFee,
-        total_spent_digcoin: (player.total_spent_digcoin || 0) + totalFee,
-    }).eq('wallet', w);
 
     return { success: true, started: miners.length, fee: totalFee };
 }
@@ -301,11 +317,23 @@ async function claimAll(wallet) {
     if (!ready.length) return { error: 'No miners ready to claim yet. Come back in 24h!' };
 
     const totalFee = CONFIG.PLAY_ALL_FEE_DIGCOIN * ready.length;
-    const { data: player } = await supabase.from('players').select('digcoin_balance').eq('wallet', w).single();
+    const { data: player } = await supabase.from('players').select('digcoin_balance, total_spent_digcoin').eq('wallet', w).single();
 
     if (player.digcoin_balance < totalFee) {
         return { error: `Insufficient balance for Claim All fee. Need ${totalFee} DIGCOIN (${CONFIG.PLAY_ALL_FEE_DIGCOIN} × ${ready.length} miners)` };
     }
+
+    // Atomic fee deduction before crediting rewards, prevents race conditions
+    const { data: feeDeducted } = await supabase.from('players')
+        .update({
+            digcoin_balance: player.digcoin_balance - totalFee,
+            total_spent_digcoin: (player.total_spent_digcoin || 0) + totalFee,
+        })
+        .eq('wallet', w)
+        .gte('digcoin_balance', totalFee)
+        .select('digcoin_balance');
+
+    if (!feeDeducted?.length) return { error: 'Insufficient balance for Claim All fee (concurrent update conflict — try again)' };
 
     let totalReward = 0, claimed = 0, died = 0;
     const details = [];
@@ -319,13 +347,6 @@ async function claimAll(wallet) {
         }
         details.push({ minerId: miner.id, rarityName: miner.rarity_name, ...result });
     }
-
-    // Debit Claim All fee (rewards already credited in claimMiner)
-    const { data: updated } = await supabase.from('players').select('digcoin_balance, total_spent_digcoin').eq('wallet', w).single();
-    await supabase.from('players').update({
-        digcoin_balance: updated.digcoin_balance - totalFee,
-        total_spent_digcoin: updated.total_spent_digcoin + totalFee,
-    }).eq('wallet', w);
 
     return {
         totalReward: Math.round(totalReward * 100) / 100,
@@ -345,19 +366,26 @@ async function repairMiner(wallet, minerId) {
     const rarity = CONFIG.RARITIES[miner.rarity_id];
     const cost = rarity.repairPathUSD * CONFIG.DIGCOIN_PER_PATHUSD;
 
-    const { data: player } = await supabase.from('players').select('digcoin_balance').eq('wallet', w).single();
+    const { data: player } = await supabase.from('players').select('digcoin_balance, total_spent_digcoin').eq('wallet', w).single();
     if (player.digcoin_balance < cost) {
         return { error: `Insufficient balance. Repair costs ${cost} DIGCOIN (${rarity.repairPathUSD} pathUSD)` };
     }
 
+    // Atomic deduction before repairing
+    const { data: deducted } = await supabase.from('players')
+        .update({
+            digcoin_balance: player.digcoin_balance - cost,
+            total_spent_digcoin: (player.total_spent_digcoin || 0) + cost,
+        })
+        .eq('wallet', w)
+        .gte('digcoin_balance', cost)
+        .select('digcoin_balance');
+
+    if (!deducted?.length) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
+
     await supabase.from('miners').update({
         nft_age_remaining: miner.nft_age_total, is_alive: true, needs_repair: false,
     }).eq('id', minerId);
-
-    await supabase.from('players').update({
-        digcoin_balance: player.digcoin_balance - cost,
-        total_spent_digcoin: (player.total_spent_digcoin || 0) + cost,
-    }).eq('wallet', w);
 
     await supabase.from('repairs').insert({ wallet: w, miner_id: minerId, cost_digcoin: cost });
 
@@ -510,12 +538,33 @@ app.post('/api/register', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Deposit
+// Deposit — requires txHash and verifies on-chain before crediting
 app.post('/api/deposit', async (req, res) => {
     try {
         const { wallet, amountPathUSD, txHash } = req.body;
         if (!wallet || !amountPathUSD) return res.status(400).json({ error: 'wallet and amountPathUSD required' });
-        const result = await processDeposit(wallet, parseFloat(amountPathUSD), txHash);
+        if (!txHash) return res.status(400).json({ error: 'txHash required — deposit must originate from on-chain transaction' });
+
+        // Verify txHash is a real Deposited event from our contract
+        const provider = new ethers.JsonRpcProvider(CONFIG.RPC_URL);
+        const iface = new ethers.Interface(['event Deposited(address indexed player, uint256 amount, uint256 timestamp)']);
+        const receipt = await provider.getTransactionReceipt(txHash).catch(() => null);
+        if (!receipt) return res.status(400).json({ error: 'Transaction not found on-chain' });
+
+        const depositLog = receipt.logs.find(log =>
+            log.address.toLowerCase() === CONFIG.POOL_CONTRACT.toLowerCase() &&
+            log.topics[0] === iface.getEvent('Deposited').topicHash
+        );
+        if (!depositLog) return res.status(400).json({ error: 'No Deposited event found in transaction' });
+
+        const parsed = iface.parseLog(depositLog);
+        const onChainWallet = parsed.args.player.toLowerCase();
+        const onChainAmount = parseFloat(ethers.formatUnits(parsed.args.amount, CONFIG.PATHUSD_DECIMALS));
+
+        if (onChainWallet !== wallet.toLowerCase()) return res.status(400).json({ error: 'Wallet mismatch — transaction belongs to a different address' });
+
+        const result = await processDeposit(onChainWallet, onChainAmount, txHash);
+        if (result.duplicate) return res.json({ success: true, duplicate: true, message: 'Already credited' });
         res.json({ success: true, ...result });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -593,7 +642,7 @@ app.post('/api/withdraw', async (req, res) => {
         const { wallet, amountDigcoin } = req.body;
         if (!wallet || !amountDigcoin) return res.status(400).json({ error: 'wallet and amountDigcoin required' });
         const w = norm(wallet);
-        const { data: player } = await supabase.from('players').select('digcoin_balance').eq('wallet', w).single();
+        const { data: player } = await supabase.from('players').select('digcoin_balance, total_withdrawn_pathusd').eq('wallet', w).single();
         const amount = parseFloat(amountDigcoin);
         if (amount <= 0 || amount > player.digcoin_balance) return res.status(400).json({ error: `Insufficient balance. Have ${player.digcoin_balance.toFixed(2)} DIGCOIN` });
 
@@ -614,10 +663,17 @@ app.post('/api/withdraw', async (req, res) => {
         const fee = amountPathUSD * (CONFIG.WITHDRAW_FEE_PERCENT / 100);
         const net = amountPathUSD - fee;
 
-        await supabase.from('players').update({
-            digcoin_balance: player.digcoin_balance - amount,
-            total_withdrawn_pathusd: (player.total_withdrawn_pathusd || 0) + net,
-        }).eq('wallet', w);
+        // Atomic deduction: only succeeds if balance hasn't changed since we read it
+        const { data: deducted } = await supabase.from('players')
+            .update({
+                digcoin_balance: player.digcoin_balance - amount,
+                total_withdrawn_pathusd: (player.total_withdrawn_pathusd || 0) + net,
+            })
+            .eq('wallet', w)
+            .gte('digcoin_balance', amount)
+            .select('digcoin_balance');
+
+        if (!deducted?.length) return res.status(400).json({ error: 'Insufficient balance (concurrent update conflict — try again)' });
 
         const sigData = await generateWithdrawSignature(w, amountPathUSD);
         await supabase.from('withdrawals').insert({ wallet: w, amount_digcoin: amount, amount_pathusd: amountPathUSD, fee_pathusd: fee, net_pathusd: net, nonce: parseInt(sigData.nonce), status: 'ready' });
@@ -658,20 +714,9 @@ app.get('/api/stats', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Testnet Faucet — gives TEMPO gas + pathUSD
-app.post('/api/faucet', async (req, res) => {
-    try {
-        const { wallet } = req.body;
-        if (!wallet) return res.status(400).json({ error: 'wallet required' });
-        const response = await fetch(CONFIG.RPC_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ jsonrpc: '2.0', method: 'tempo_fundAddress', params: [wallet], id: 1 }),
-        });
-        const data = await response.json();
-        if (data.error) return res.status(400).json({ error: data.error.message });
-        res.json({ success: true, txHashes: data.result, message: 'Funded with TEMPO gas + pathUSD testnet tokens' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+// Faucet — disabled on mainnet
+app.post('/api/faucet', (_req, res) => {
+    res.status(403).json({ error: 'Faucet not available on mainnet' });
 });
 
 // Config (public)
