@@ -846,6 +846,11 @@ app.get('/api/history/:wallet', requireAuth, async (req, res) => {
 // ADMIN ROUTES
 // ════════════════════════════════════════════
 
+// Public: any client can check maintenance state (used for full-screen overlay)
+app.get('/api/maintenance', (_req, res) => {
+    res.json({ maintenance: MAINTENANCE_MODE });
+});
+
 // Check if current session is admin (used by frontend to show/hide panel)
 app.get('/api/admin/status', requireAdmin, (_req, res) => {
     res.json({ isAdmin: true, maintenance: MAINTENANCE_MODE, adminWallet: CONFIG.ADMIN_WALLET });
