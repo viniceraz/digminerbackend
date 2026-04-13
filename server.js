@@ -9,18 +9,16 @@
 
 try { require('dotenv').config(); } catch(e) {}
 
-// Startup env check — helps debug Railway / production issues
-console.log('[ENV] SUPABASE_URL:', process.env.SUPABASE_URL ? '✅ set' : '❌ MISSING');
-console.log('[ENV] SUPABASE_SERVICE_KEY:', process.env.SUPABASE_SERVICE_KEY ? '✅ set' : '❌ MISSING');
-console.log('[ENV] RPC_URL:', process.env.RPC_URL || '❌ MISSING');
-console.log('[ENV] CHAIN_ID:', process.env.CHAIN_ID || '❌ MISSING');
-console.log('[ENV] POOL_CONTRACT:', process.env.POOL_CONTRACT || '❌ MISSING');
-console.log('[ENV] SIGNER_PRIVATE_KEY:', process.env.SIGNER_PRIVATE_KEY ? '✅ set' : '❌ MISSING');
-
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
-    console.error('\n❌ FATAL: Supabase env vars missing. Set SUPABASE_URL and SUPABASE_SERVICE_KEY in Railway Variables.\n');
-    process.exit(1);
-}
+// Startup env check
+const ENV_STATUS = {
+    SUPABASE_URL:        !!process.env.SUPABASE_URL,
+    SUPABASE_SERVICE_KEY:!!process.env.SUPABASE_SERVICE_KEY,
+    RPC_URL:             process.env.RPC_URL || '❌ MISSING',
+    CHAIN_ID:            process.env.CHAIN_ID || '❌ MISSING',
+    POOL_CONTRACT:       process.env.POOL_CONTRACT || '❌ MISSING',
+    SIGNER_PRIVATE_KEY:  !!process.env.SIGNER_PRIVATE_KEY,
+};
+console.log('[ENV CHECK]', JSON.stringify(ENV_STATUS));
 
 const express = require('express');
 const cors = require('cors');
@@ -31,13 +29,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Health — always up, shows which env vars are loaded
+app.get('/health', (_req, res) => res.json({ ok: true, env: ENV_STATUS, ts: new Date().toISOString() }));
+
 // ════════════════════════════════════════════
 // SUPABASE CLIENT
 // ════════════════════════════════════════════
 
 const supabase = createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_KEY
+    process.env.SUPABASE_URL || 'https://placeholder.supabase.co',
+    process.env.SUPABASE_SERVICE_KEY || 'placeholder-key'
 );
 
 // ════════════════════════════════════════════
