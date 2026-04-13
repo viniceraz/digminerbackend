@@ -26,13 +26,33 @@ const express = require('express');
 const cors = require('cors');
 const { ethers } = require('ethers');
 const { createClient } = require('@supabase/supabase-js');
+const { rateLimit } = require('express-rate-limit');
 
 const app = express();
 app.use(cors({
     origin: ['https://digminer.xyz', 'https://www.digminer.xyz', 'http://localhost:5173', 'http://localhost:3000'],
     methods: ['GET', 'POST'],
 }));
-app.use(express.json({ limit: '16kb' })); // cap request body size
+app.use(express.json({ limit: '16kb' }));
+
+// Global rate limit: 60 requests per minute per IP
+app.use(rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests — slow down and try again in a minute' },
+    skip: (req) => req.path === '/health', // health check always passes
+}));
+
+// Stricter limit for financial write endpoints: 10 per minute per IP
+const financialLimit = rateLimit({
+    windowMs: 60 * 1000,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests on this endpoint — wait a minute' },
+});
 
 // Health — always up, shows which env vars are loaded
 app.get('/health', (_req, res) => res.json({ ok: true, env: ENV_STATUS, ts: new Date().toISOString() }));
@@ -636,7 +656,7 @@ app.post('/api/register', async (req, res) => {
 });
 
 // Deposit — requires txHash and verifies on-chain before crediting
-app.post('/api/deposit', checkMaintenance, requireAuth, async (req, res) => {
+app.post('/api/deposit', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
     try {
         const { wallet, amountPathUSD, txHash } = req.body;
         if (!wallet || !amountPathUSD) return res.status(400).json({ error: 'wallet and amountPathUSD required' });
@@ -667,7 +687,7 @@ app.post('/api/deposit', checkMaintenance, requireAuth, async (req, res) => {
 });
 
 // Buy Box (1 or 10)
-app.post('/api/box/buy', checkMaintenance, requireAuth, async (req, res) => {
+app.post('/api/box/buy', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
     try {
         const { wallet, quantity } = req.body;
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
@@ -740,7 +760,7 @@ app.post('/api/repair/:minerId', checkMaintenance, requireAuth, async (req, res)
 });
 
 // Withdraw
-app.post('/api/withdraw', checkMaintenance, requireAuth, async (req, res) => {
+app.post('/api/withdraw', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
     try {
         const { wallet, amountDigcoin } = req.body;
         if (!wallet || !amountDigcoin) return res.status(400).json({ error: 'wallet and amountDigcoin required' });
@@ -780,7 +800,20 @@ app.post('/api/withdraw', checkMaintenance, requireAuth, async (req, res) => {
 
         if (!deducted?.length) return res.status(400).json({ error: 'Insufficient balance (concurrent update conflict — try again)' });
 
-        const sigData = await generateWithdrawSignature(w, amountPathUSD);
+        // Generate signature — if this fails, restore balance so user is not left stranded
+        let sigData;
+        try {
+            sigData = await generateWithdrawSignature(w, amountPathUSD);
+        } catch (sigErr) {
+            // Rollback: restore the deducted balance
+            await supabase.from('players').update({
+                digcoin_balance: player.digcoin_balance, // original value before deduction
+                total_withdrawn_pathusd: player.total_withdrawn_pathusd || 0,
+            }).eq('wallet', w);
+            console.error(`❌ Withdraw signature failed for ${w}, balance restored:`, sigErr.message);
+            return res.status(500).json({ error: 'Failed to generate withdrawal signature — balance restored, please try again' });
+        }
+
         await supabase.from('withdrawals').insert({ wallet: w, amount_digcoin: amount, amount_pathusd: amountPathUSD, fee_pathusd: fee, net_pathusd: net, nonce: parseInt(sigData.nonce), status: 'ready' });
 
         res.json({ success: true, amountDigcoin: amount, amountPathUSD, feePathUSD: fee, netPathUSD: net, signature: sigData });
