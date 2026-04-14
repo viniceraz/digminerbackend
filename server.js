@@ -14,11 +14,11 @@ const crypto = require('crypto');
 const ENV_STATUS = {
     SUPABASE_URL:        !!process.env.SUPABASE_URL,
     SUPABASE_SERVICE_KEY:!!process.env.SUPABASE_SERVICE_KEY,
-    RPC_URL:             process.env.RPC_URL || '❌ MISSING',
-    CHAIN_ID:            process.env.CHAIN_ID || '❌ MISSING',
-    POOL_CONTRACT:       process.env.POOL_CONTRACT || '❌ MISSING',
+    RPC_URL:             !!process.env.RPC_URL,
+    CHAIN_ID:            !!process.env.CHAIN_ID,
+    POOL_CONTRACT:       !!process.env.POOL_CONTRACT,
     SIGNER_PRIVATE_KEY:  !!process.env.SIGNER_PRIVATE_KEY,
-    ADMIN_WALLET:        process.env.ADMIN_WALLET || '❌ MISSING',
+    ADMIN_WALLET:        !!process.env.ADMIN_WALLET,
 };
 console.log('[ENV CHECK]', JSON.stringify(ENV_STATUS));
 
