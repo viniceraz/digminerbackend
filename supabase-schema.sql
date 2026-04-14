@@ -78,8 +78,12 @@ CREATE TABLE IF NOT EXISTS box_purchases (
     wallet TEXT NOT NULL,
     miner_id BIGINT,
     cost_digcoin DOUBLE PRECISION NOT NULL,
+    box_type TEXT DEFAULT 'regular',  -- 'regular' | 'sale'
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Migration: add box_type to existing table if not present
+ALTER TABLE box_purchases ADD COLUMN IF NOT EXISTS box_type TEXT DEFAULT 'regular';
 
 -- Repairs
 CREATE TABLE IF NOT EXISTS repairs (

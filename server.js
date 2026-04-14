@@ -84,6 +84,9 @@ const CONFIG = {
     BOX_PRICE_DIGCOIN: 300,        // 3 pathUSD
     BOX_BULK_QUANTITY: 10,
     BOX_BULK_PRICE_DIGCOIN: 2850,  // 10 boxes = 5% discount
+    SALE_BOX_PRICE_DIGCOIN: 150,   // 50% off limited sale
+    SALE_BOX_MAX_TOTAL: 2000,      // global supply cap
+    SALE_BOX_MAX_PER_WALLET: 50,   // per-wallet cap
     WITHDRAW_FEE_PERCENT: 10,
     REFERRAL_PERCENT: 4,
     PLAY_COOLDOWN_MS: 24 * 60 * 60 * 1000,
@@ -298,6 +301,83 @@ async function buyBoxes(wallet, quantity = 1) {
     }
 
     return { success: true, miners, cost, discount: quantity === CONFIG.BOX_BULK_QUANTITY ? '5%' : null };
+}
+
+async function getSaleBoxCounts(wallet) {
+    const w = norm(wallet);
+    const [{ count: totalSold }, { count: walletBought }] = await Promise.all([
+        supabase.from('box_purchases').select('*', { count: 'exact', head: true }).eq('box_type', 'sale'),
+        supabase.from('box_purchases').select('*', { count: 'exact', head: true }).eq('box_type', 'sale').eq('wallet', w),
+    ]);
+    return { totalSold: totalSold || 0, walletBought: walletBought || 0 };
+}
+
+async function buySaleBoxes(wallet, quantity = 1) {
+    const w = norm(wallet);
+    const price = CONFIG.SALE_BOX_PRICE_DIGCOIN;
+    const cost = price * quantity;
+
+    // Validate limits
+    const { totalSold, walletBought } = await getSaleBoxCounts(w);
+    const globalRemaining = CONFIG.SALE_BOX_MAX_TOTAL - totalSold;
+    const walletRemaining = CONFIG.SALE_BOX_MAX_PER_WALLET - walletBought;
+
+    if (globalRemaining <= 0) return { error: 'Sale boxes are sold out!' };
+    if (walletRemaining <= 0) return { error: `Wallet limit reached (max ${CONFIG.SALE_BOX_MAX_PER_WALLET} sale boxes per wallet)` };
+    if (quantity > globalRemaining) return { error: `Only ${globalRemaining} sale boxes left globally` };
+    if (quantity > walletRemaining) return { error: `You can only buy ${walletRemaining} more sale boxes` };
+
+    const player = await getOrCreatePlayer(w);
+    if (player.digcoin_balance < cost) {
+        return { error: `Insufficient balance. Need ${cost} DIGCOIN (have ${player.digcoin_balance.toFixed(2)})` };
+    }
+
+    const { data: deducted } = await supabase.from('players')
+        .update({
+            digcoin_balance: player.digcoin_balance - cost,
+            total_spent_digcoin: player.total_spent_digcoin + cost,
+            boxes_bought: player.boxes_bought + quantity,
+        })
+        .eq('wallet', w)
+        .gte('digcoin_balance', cost)
+        .select('digcoin_balance');
+
+    if (!deducted?.length) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
+
+    const miners = [];
+    try {
+        for (let i = 0; i < quantity; i++) {
+            const rarity = rollRarity();
+            const dailyDigcoin = randBetween(rarity.dailyMin, rarity.dailyMax);
+            const stats = generateStats(rarity);
+
+            const { data: miner, error: minerErr } = await supabase.from('miners').insert({
+                wallet: w, rarity_id: rarity.id, rarity_name: rarity.name,
+                daily_digcoin: dailyDigcoin, nft_age_total: rarity.nftAge, nft_age_remaining: rarity.nftAge,
+                ...stats,
+            }).select().single();
+
+            if (minerErr || !miner) throw new Error(minerErr?.message || 'Failed to create miner');
+
+            await supabase.from('box_purchases').insert({ wallet: w, miner_id: miner.id, cost_digcoin: price, box_type: 'sale' });
+
+            miners.push({
+                id: miner.id, rarityId: rarity.id, rarityName: rarity.name,
+                dailyDigcoin, nftAge: rarity.nftAge, color: rarity.color, ...stats,
+                roi: Math.ceil(price / dailyDigcoin),
+            });
+        }
+    } catch (insertErr) {
+        await supabase.from('players').update({
+            digcoin_balance: player.digcoin_balance,
+            total_spent_digcoin: player.total_spent_digcoin,
+            boxes_bought: player.boxes_bought,
+        }).eq('wallet', w);
+        console.error(`❌ buySaleBoxes insert failed for ${w}, balance restored:`, insertErr.message);
+        return { error: 'Failed to open sale box — balance restored, please try again' };
+    }
+
+    return { success: true, miners, cost, saleBox: true };
 }
 
 // Start mining: idle miner → sets last_play_at = NOW, no reward yet
@@ -736,6 +816,35 @@ app.post('/api/box/buy', financialLimit, checkMaintenance, requireAuth, async (r
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Sale Box info (global sold + wallet bought)
+app.get('/api/box/sale-info', async (req, res) => {
+    try {
+        const wallet = req.query.wallet || '';
+        const counts = await getSaleBoxCounts(wallet);
+        res.json({
+            totalSold: counts.totalSold,
+            walletBought: counts.walletBought,
+            maxTotal: CONFIG.SALE_BOX_MAX_TOTAL,
+            maxPerWallet: CONFIG.SALE_BOX_MAX_PER_WALLET,
+            price: CONFIG.SALE_BOX_PRICE_DIGCOIN,
+            globalRemaining: Math.max(0, CONFIG.SALE_BOX_MAX_TOTAL - counts.totalSold),
+            walletRemaining: Math.max(0, CONFIG.SALE_BOX_MAX_PER_WALLET - counts.walletBought),
+        });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Buy Sale Box (limited 50% off)
+app.post('/api/box/buy-sale', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
+    try {
+        const { wallet, quantity } = req.body;
+        if (!wallet) return res.status(400).json({ error: 'wallet required' });
+        const qty = Math.max(1, Math.min(parseInt(quantity) || 1, CONFIG.SALE_BOX_MAX_PER_WALLET));
+        const result = await buySaleBoxes(wallet, qty);
+        if (result.error) return res.status(400).json(result);
+        res.json(result);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Mine single miner (idle → start 24h cycle)
 app.post('/api/play/:minerId', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
     try {
@@ -996,6 +1105,9 @@ app.get('/api/config', (req, res) => {
         boxPriceDigcoin: CONFIG.BOX_PRICE_DIGCOIN,
         boxBulkQuantity: CONFIG.BOX_BULK_QUANTITY,
         boxBulkPriceDigcoin: CONFIG.BOX_BULK_PRICE_DIGCOIN,
+        saleBoxPriceDigcoin: CONFIG.SALE_BOX_PRICE_DIGCOIN,
+        saleBoxMaxTotal: CONFIG.SALE_BOX_MAX_TOTAL,
+        saleBoxMaxPerWallet: CONFIG.SALE_BOX_MAX_PER_WALLET,
         digcoinPerPathUSD: CONFIG.DIGCOIN_PER_PATHUSD,
         withdrawFee: CONFIG.WITHDRAW_FEE_PERCENT + '%',
         referralBonus: CONFIG.REFERRAL_PERCENT + '%',
