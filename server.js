@@ -84,6 +84,7 @@ const CONFIG = {
     BOX_PRICE_DIGCOIN: 300,        // 3 pathUSD
     BOX_BULK_QUANTITY: 10,
     BOX_BULK_PRICE_DIGCOIN: 2850,  // 10 boxes = 5% discount
+    FUSE_COST_DIGCOIN: 150,             // cost to fuse 2 miners
     SALE_BOX_PRICE_DIGCOIN: 150,        // 50% off limited sale
     SALE_BOX_MAX_TOTAL: 2000,           // global supply cap
     SALE_BOX_MAX_PER_WALLET: 50,        // per-wallet cap
@@ -411,6 +412,86 @@ async function buySaleBoxes(wallet, quantity = 1) {
     }
 
     return { success: true, miners, cost, saleBox: true };
+}
+
+// ════════════════════════════════════════════
+// FUSE MINERS
+// ════════════════════════════════════════════
+
+async function fuseMiner(wallet, minerId1, minerId2) {
+    const w = norm(wallet);
+
+    if (minerId1 === minerId2) return { error: 'Cannot fuse a miner with itself' };
+
+    // Fetch both miners — must belong to this wallet
+    const [{ data: m1 }, { data: m2 }] = await Promise.all([
+        supabase.from('miners').select('*').eq('id', minerId1).eq('wallet', w).single(),
+        supabase.from('miners').select('*').eq('id', minerId2).eq('wallet', w).single(),
+    ]);
+
+    if (!m1) return { error: 'Miner #' + minerId1 + ' not found' };
+    if (!m2) return { error: 'Miner #' + minerId2 + ' not found' };
+
+    // Both must be idle (not currently mining)
+    if (m1.last_play_at) return { error: 'Miner #' + minerId1 + ' is currently mining. Claim first.' };
+    if (m2.last_play_at) return { error: 'Miner #' + minerId2 + ' is currently mining. Claim first.' };
+
+    // Fetch balance and deduct atomically
+    const cost = CONFIG.FUSE_COST_DIGCOIN;
+    const { data: player } = await supabase.from('players').select('digcoin_balance, total_spent_digcoin').eq('wallet', w).single();
+    if (!player) return { error: 'Player not found' };
+    if (player.digcoin_balance < cost) return { error: `Insufficient balance. Need ${cost} DIGCOIN to fuse.` };
+
+    const { data: updated } = await supabase.from('players')
+        .update({ digcoin_balance: player.digcoin_balance - cost, total_spent_digcoin: (player.total_spent_digcoin || 0) + cost })
+        .eq('wallet', w)
+        .gte('digcoin_balance', cost)
+        .select('digcoin_balance')
+        .single();
+
+    if (!updated) return { error: 'Insufficient balance (concurrent update — try again)' };
+
+    // Determine result rarity
+    const highId = Math.max(m1.rarity_id, m2.rarity_id);
+    const sameRarity = m1.rarity_id === m2.rarity_id;
+    // Same rarity: always upgrades at least 1 tier; Different: 80% keep highest, 20% jump 2 tiers
+    const base80 = sameRarity ? Math.min(highId + 1, 5) : highId;
+    const base20 = Math.min(highId + 2, 5);
+    const resultRarityId = Math.random() < 0.80 ? base80 : base20;
+
+    const rarity = CONFIG.RARITIES[resultRarityId];
+    const dailyDigcoin = randBetween(rarity.dailyMin, rarity.dailyMax);
+    const stats = generateStats(rarity);
+
+    // Create new miner
+    const { data: newMiner, error: insertErr } = await supabase.from('miners').insert({
+        wallet: w,
+        rarity_id: rarity.id,
+        rarity_name: rarity.name,
+        daily_digcoin: dailyDigcoin,
+        nft_age_total: rarity.nftAge,
+        nft_age_remaining: rarity.nftAge,
+        ...stats,
+    }).select().single();
+
+    if (insertErr || !newMiner) {
+        // Refund on failure
+        const { data: fresh } = await supabase.from('players').select('digcoin_balance').eq('wallet', w).single();
+        await supabase.from('players').update({ digcoin_balance: (fresh?.digcoin_balance || 0) + cost }).eq('wallet', w);
+        return { error: 'Failed to create fused miner — balance restored, please try again' };
+    }
+
+    // Delete the 2 original miners
+    await supabase.from('miners').delete().in('id', [minerId1, minerId2]);
+
+    console.log(`🔥 Fuse: ${w} fused #${minerId1}(${m1.rarity_name}) + #${minerId2}(${m2.rarity_name}) → #${newMiner.id}(${rarity.name})`);
+
+    return {
+        success: true,
+        miner: { ...newMiner, rarityId: newMiner.rarity_id, rarityName: newMiner.rarity_name },
+        consumed: [minerId1, minerId2],
+        cost,
+    };
 }
 
 // Start mining: idle miner → sets last_play_at = NOW, no reward yet
@@ -882,6 +963,19 @@ app.post('/api/box/buy-sale', financialLimit, checkMaintenance, requireAuth, asy
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Fuse 2 miners → 1 new miner
+app.post('/api/miner/fuse', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
+    try {
+        const { wallet, minerId1, minerId2 } = req.body;
+        if (!wallet) return res.status(400).json({ error: 'wallet required' });
+        const id1 = parseInt(minerId1), id2 = parseInt(minerId2);
+        if (!isValidMinerId(id1) || !isValidMinerId(id2)) return res.status(400).json({ error: 'Invalid miner IDs' });
+        const result = await fuseMiner(wallet, id1, id2);
+        if (result.error) return res.status(400).json(result);
+        res.json(result);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Mine single miner (idle → start 24h cycle)
 app.post('/api/play/:minerId', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
     try {
@@ -1147,6 +1241,7 @@ app.get('/api/config', (req, res) => {
         saleBoxMaxPerWallet: CONFIG.SALE_BOX_MAX_PER_WALLET,
         saleBoxEndTime: CONFIG.SALE_BOX_END_TIME,
         saleBoxIsActive: Date.now() < CONFIG.SALE_BOX_END_TIME,
+        fuseCostDigcoin: CONFIG.FUSE_COST_DIGCOIN,
         digcoinPerPathUSD: CONFIG.DIGCOIN_PER_PATHUSD,
         withdrawFee: CONFIG.WITHDRAW_FEE_PERCENT + '%',
         referralBonus: CONFIG.REFERRAL_PERCENT + '%',
