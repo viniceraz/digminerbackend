@@ -809,14 +809,16 @@ app.post('/api/withdraw', financialLimit, checkMaintenance, requireAuth, async (
         if (isNaN(amount) || amount < MIN_WITHDRAW) return res.status(400).json({ error: `Minimum withdrawal is ${MIN_WITHDRAW} DIGCOIN (1 pathUSD)` });
         if (amount > player.digcoin_balance) return res.status(400).json({ error: `Insufficient balance. Have ${player.digcoin_balance.toFixed(2)} DIGCOIN` });
 
-        // 24h cooldown per wallet
+        const COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+        // Initial cooldown check (fast-path rejection for obvious cases)
         const { data: lastWithdraw } = await supabase.from('withdrawals')
-            .select('created_at').eq('wallet', w).order('created_at', { ascending: false }).limit(1);
+            .select('created_at').eq('wallet', w).neq('status', 'cancelled')
+            .order('created_at', { ascending: false }).limit(1);
         if (lastWithdraw?.length) {
             const elapsed = Date.now() - new Date(lastWithdraw[0].created_at).getTime();
-            const cooldown = 24 * 60 * 60 * 1000;
-            if (elapsed < cooldown) {
-                const rem = cooldown - elapsed;
+            if (elapsed < COOLDOWN_MS) {
+                const rem = COOLDOWN_MS - elapsed;
                 const h = Math.floor(rem / 3600000), m = Math.floor((rem % 3600000) / 60000);
                 return res.status(400).json({ error: `Withdraw cooldown: wait ${h}h ${m}m`, cooldownMs: rem });
             }
@@ -826,7 +828,34 @@ app.post('/api/withdraw', financialLimit, checkMaintenance, requireAuth, async (
         const fee = amountPathUSD * (CONFIG.WITHDRAW_FEE_PERCENT / 100);
         const net = amountPathUSD - fee;
 
-        // Atomic deduction: only succeeds if balance hasn't changed since we read it
+        // INSERT "pending" record FIRST — this is the atomic lock that closes the race window.
+        // Any concurrent request that checks cooldown AFTER this point will see this record and be blocked.
+        const { data: pending, error: pendingErr } = await supabase.from('withdrawals')
+            .insert({ wallet: w, amount_digcoin: amount, amount_pathusd: amountPathUSD, fee_pathusd: fee, net_pathusd: net, nonce: 0, status: 'pending' })
+            .select('id').single();
+
+        if (pendingErr || !pending) {
+            return res.status(500).json({ error: 'Failed to reserve withdrawal slot — please try again' });
+        }
+
+        // Re-check cooldown to catch concurrent requests that slipped through the initial check.
+        // Look for any non-cancelled withdrawal in the last 24h OTHER than the one we just inserted.
+        const { data: recheck } = await supabase.from('withdrawals')
+            .select('id, created_at').eq('wallet', w).neq('status', 'cancelled').neq('id', pending.id)
+            .order('created_at', { ascending: false }).limit(1);
+
+        if (recheck?.length) {
+            const elapsed = Date.now() - new Date(recheck[0].created_at).getTime();
+            if (elapsed < COOLDOWN_MS) {
+                // Race detected — cancel our pending record and return cooldown error
+                await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id);
+                const rem = COOLDOWN_MS - elapsed;
+                const h = Math.floor(rem / 3600000), m = Math.floor((rem % 3600000) / 60000);
+                return res.status(400).json({ error: `Withdraw cooldown: wait ${h}h ${m}m`, cooldownMs: rem });
+            }
+        }
+
+        // Atomic balance deduction
         const { data: deducted } = await supabase.from('players')
             .update({
                 digcoin_balance: player.digcoin_balance - amount,
@@ -836,23 +865,29 @@ app.post('/api/withdraw', financialLimit, checkMaintenance, requireAuth, async (
             .gte('digcoin_balance', amount)
             .select('digcoin_balance');
 
-        if (!deducted?.length) return res.status(400).json({ error: 'Insufficient balance (concurrent update conflict — try again)' });
+        if (!deducted?.length) {
+            await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id);
+            return res.status(400).json({ error: 'Insufficient balance (concurrent update conflict — try again)' });
+        }
 
-        // Generate signature — if this fails, restore balance so user is not left stranded
+        // Generate signature — if this fails, restore balance and cancel the pending record
         let sigData;
         try {
             sigData = await generateWithdrawSignature(w, amountPathUSD);
         } catch (sigErr) {
-            // Rollback: restore the deducted balance
             await supabase.from('players').update({
-                digcoin_balance: player.digcoin_balance, // original value before deduction
+                digcoin_balance: player.digcoin_balance,
                 total_withdrawn_pathusd: player.total_withdrawn_pathusd || 0,
             }).eq('wallet', w);
+            await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id);
             console.error(`❌ Withdraw signature failed for ${w}, balance restored:`, sigErr.message);
             return res.status(500).json({ error: 'Failed to generate withdrawal signature — balance restored, please try again' });
         }
 
-        await supabase.from('withdrawals').insert({ wallet: w, amount_digcoin: amount, amount_pathusd: amountPathUSD, fee_pathusd: fee, net_pathusd: net, nonce: parseInt(sigData.nonce), status: 'ready' });
+        // Promote pending → ready with the real nonce
+        await supabase.from('withdrawals')
+            .update({ nonce: parseInt(sigData.nonce), status: 'ready' })
+            .eq('id', pending.id);
 
         res.json({ success: true, amountDigcoin: amount, amountPathUSD, feePathUSD: fee, netPathUSD: net, signature: sigData });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -866,7 +901,7 @@ app.get('/api/history/:wallet', requireAuth, async (req, res) => {
         const limit = Math.min(parseInt(req.query.limit) || 50, 100);
         const { data: plays } = await supabase.from('play_history').select('*').eq('wallet', w).order('played_at', { ascending: false }).limit(limit);
         const { data: deps } = await supabase.from('deposits').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(limit);
-        const { data: withs } = await supabase.from('withdrawals').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(limit);
+        const { data: withs } = await supabase.from('withdrawals').select('*').eq('wallet', w).eq('status', 'ready').order('created_at', { ascending: false }).limit(limit);
         const { data: boxes } = await supabase.from('box_purchases').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(limit);
 
         const txs = [
