@@ -84,9 +84,11 @@ const CONFIG = {
     BOX_PRICE_DIGCOIN: 300,        // 3 pathUSD
     BOX_BULK_QUANTITY: 10,
     BOX_BULK_PRICE_DIGCOIN: 2850,  // 10 boxes = 5% discount
-    SALE_BOX_PRICE_DIGCOIN: 150,   // 50% off limited sale
-    SALE_BOX_MAX_TOTAL: 2000,      // global supply cap
-    SALE_BOX_MAX_PER_WALLET: 50,   // per-wallet cap
+    SALE_BOX_PRICE_DIGCOIN: 150,        // 50% off limited sale
+    SALE_BOX_MAX_TOTAL: 2000,           // global supply cap
+    SALE_BOX_MAX_PER_WALLET: 50,        // per-wallet cap
+    SALE_BOX_DURATION_MS: 30 * 60 * 1000, // 30 minutes from server start
+    SALE_BOX_END_TIME: Date.now() + 30 * 60 * 1000, // set at startup
     WITHDRAW_FEE_PERCENT: 10,
     REFERRAL_PERCENT: 4,
     PLAY_COOLDOWN_MS: 24 * 60 * 60 * 1000,
@@ -322,6 +324,7 @@ async function buySaleBoxes(wallet, quantity = 1) {
     const globalRemaining = CONFIG.SALE_BOX_MAX_TOTAL - totalSold;
     const walletRemaining = CONFIG.SALE_BOX_MAX_PER_WALLET - walletBought;
 
+    if (Date.now() > CONFIG.SALE_BOX_END_TIME) return { error: 'The sale has ended! Only regular boxes are available.' };
     if (globalRemaining <= 0) return { error: 'Sale boxes are sold out!' };
     if (walletRemaining <= 0) return { error: `Wallet limit reached (max ${CONFIG.SALE_BOX_MAX_PER_WALLET} sale boxes per wallet)` };
     if (quantity > globalRemaining) return { error: `Only ${globalRemaining} sale boxes left globally` };
@@ -851,6 +854,8 @@ app.get('/api/box/sale-info', async (req, res) => {
     try {
         const wallet = req.query.wallet || '';
         const counts = await getSaleBoxCounts(wallet);
+        const now = Date.now();
+        const isActive = now < CONFIG.SALE_BOX_END_TIME;
         res.json({
             totalSold: counts.totalSold,
             walletBought: counts.walletBought,
@@ -859,6 +864,8 @@ app.get('/api/box/sale-info', async (req, res) => {
             price: CONFIG.SALE_BOX_PRICE_DIGCOIN,
             globalRemaining: Math.max(0, CONFIG.SALE_BOX_MAX_TOTAL - counts.totalSold),
             walletRemaining: Math.max(0, CONFIG.SALE_BOX_MAX_PER_WALLET - counts.walletBought),
+            endTime: CONFIG.SALE_BOX_END_TIME,
+            isActive,
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1138,6 +1145,8 @@ app.get('/api/config', (req, res) => {
         saleBoxPriceDigcoin: CONFIG.SALE_BOX_PRICE_DIGCOIN,
         saleBoxMaxTotal: CONFIG.SALE_BOX_MAX_TOTAL,
         saleBoxMaxPerWallet: CONFIG.SALE_BOX_MAX_PER_WALLET,
+        saleBoxEndTime: CONFIG.SALE_BOX_END_TIME,
+        saleBoxIsActive: Date.now() < CONFIG.SALE_BOX_END_TIME,
         digcoinPerPathUSD: CONFIG.DIGCOIN_PER_PATHUSD,
         withdrawFee: CONFIG.WITHDRAW_FEE_PERCENT + '%',
         referralBonus: CONFIG.REFERRAL_PERCENT + '%',
