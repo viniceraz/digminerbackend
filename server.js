@@ -84,7 +84,7 @@ const CONFIG = {
     BOX_PRICE_DIGCOIN: 300,        // 3 pathUSD
     BOX_BULK_QUANTITY: 10,
     BOX_BULK_PRICE_DIGCOIN: 2850,  // 10 boxes = 5% discount
-    FUSE_COST_DIGCOIN: 150,             // cost to fuse 2 miners
+    FUSE_COST_DIGCOIN: 50,              // cost to fuse 2 miners
     SALE_BOX_PRICE_DIGCOIN: 150,        // 50% off limited sale
     SALE_BOX_MAX_TOTAL: 2000,           // global supply cap
     SALE_BOX_MAX_PER_WALLET: 50,        // per-wallet cap
