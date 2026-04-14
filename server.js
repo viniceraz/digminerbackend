@@ -317,7 +317,7 @@ async function buySaleBoxes(wallet, quantity = 1) {
     const price = CONFIG.SALE_BOX_PRICE_DIGCOIN;
     const cost = price * quantity;
 
-    // Validate limits
+    // Check 1 — pre-deduction fast-path rejection
     const { totalSold, walletBought } = await getSaleBoxCounts(w);
     const globalRemaining = CONFIG.SALE_BOX_MAX_TOTAL - totalSold;
     const walletRemaining = CONFIG.SALE_BOX_MAX_PER_WALLET - walletBought;
@@ -332,6 +332,7 @@ async function buySaleBoxes(wallet, quantity = 1) {
         return { error: `Insufficient balance. Need ${cost} DIGCOIN (have ${player.digcoin_balance.toFixed(2)})` };
     }
 
+    // Atomic balance deduction
     const { data: deducted } = await supabase.from('players')
         .update({
             digcoin_balance: player.digcoin_balance - cost,
@@ -344,7 +345,25 @@ async function buySaleBoxes(wallet, quantity = 1) {
 
     if (!deducted?.length) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
 
+    // Check 2 — post-deduction re-check to close TOCTOU window on sale limits
+    // (concurrent requests may have both passed Check 1 before either inserted box_purchases)
+    const { totalSold: totalSold2, walletBought: walletBought2 } = await getSaleBoxCounts(w);
+    if (totalSold2 > CONFIG.SALE_BOX_MAX_TOTAL || walletBought2 > CONFIG.SALE_BOX_MAX_PER_WALLET) {
+        // Re-fetch fresh balance to avoid stale-snapshot corruption on refund
+        const { data: fresh } = await supabase.from('players')
+            .select('digcoin_balance, total_spent_digcoin, boxes_bought').eq('wallet', w).single();
+        if (fresh) {
+            await supabase.from('players').update({
+                digcoin_balance: fresh.digcoin_balance + cost,
+                total_spent_digcoin: fresh.total_spent_digcoin - cost,
+                boxes_bought: fresh.boxes_bought - quantity,
+            }).eq('wallet', w);
+        }
+        return { error: 'Sale box limit exceeded (concurrent purchase) — balance restored, try again' };
+    }
+
     const miners = [];
+    const insertedMinerIds = [];
     try {
         for (let i = 0; i < quantity; i++) {
             const rarity = rollRarity();
@@ -359,6 +378,7 @@ async function buySaleBoxes(wallet, quantity = 1) {
 
             if (minerErr || !miner) throw new Error(minerErr?.message || 'Failed to create miner');
 
+            insertedMinerIds.push(miner.id);
             await supabase.from('box_purchases').insert({ wallet: w, miner_id: miner.id, cost_digcoin: price, box_type: 'sale' });
 
             miners.push({
@@ -368,11 +388,21 @@ async function buySaleBoxes(wallet, quantity = 1) {
             });
         }
     } catch (insertErr) {
-        await supabase.from('players').update({
-            digcoin_balance: player.digcoin_balance,
-            total_spent_digcoin: player.total_spent_digcoin,
-            boxes_bought: player.boxes_bought,
-        }).eq('wallet', w);
+        // Full rollback: delete orphaned miners + their box_purchases (preserves sale quota)
+        if (insertedMinerIds.length > 0) {
+            await supabase.from('box_purchases').delete().in('miner_id', insertedMinerIds).eq('box_type', 'sale');
+            await supabase.from('miners').delete().in('id', insertedMinerIds);
+        }
+        // Re-fetch fresh balance to avoid stale-snapshot corruption on refund
+        const { data: fresh } = await supabase.from('players')
+            .select('digcoin_balance, total_spent_digcoin, boxes_bought').eq('wallet', w).single();
+        if (fresh) {
+            await supabase.from('players').update({
+                digcoin_balance: fresh.digcoin_balance + cost,
+                total_spent_digcoin: fresh.total_spent_digcoin - cost,
+                boxes_bought: fresh.boxes_bought - quantity,
+            }).eq('wallet', w);
+        }
         console.error(`❌ buySaleBoxes insert failed for ${w}, balance restored:`, insertErr.message);
         return { error: 'Failed to open sale box — balance restored, please try again' };
     }
