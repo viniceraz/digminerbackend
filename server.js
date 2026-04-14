@@ -88,8 +88,7 @@ const CONFIG = {
     SALE_BOX_PRICE_DIGCOIN: 150,        // 50% off limited sale
     SALE_BOX_MAX_TOTAL: 2000,           // global supply cap
     SALE_BOX_MAX_PER_WALLET: 50,        // per-wallet cap
-    SALE_BOX_DURATION_MS: 30 * 60 * 1000, // 30 minutes from server start
-    SALE_BOX_END_TIME: Date.now() + 30 * 60 * 1000, // set at startup
+    SALE_BOX_END_TIME: 0, // sale permanently closed
     WITHDRAW_FEE_PERCENT: 10,
     REFERRAL_PERCENT: 4,
     PLAY_COOLDOWN_MS: 24 * 60 * 60 * 1000,
