@@ -96,12 +96,12 @@ const CONFIG = {
     SIGNATURE_DEADLINE_SECS: 3600,
 
     RARITIES: [
-        { id: 0, name: 'Common',     chance: 30, dailyMin: 18, dailyMax: 20, nftAge: 45, repairPathUSD: 0.24, color: '#9E9E9E' },
-        { id: 1, name: 'UnCommon',   chance: 30, dailyMin: 21, dailyMax: 23, nftAge: 48, repairPathUSD: 0.40, color: '#4CAF50' },
-        { id: 2, name: 'Rare',       chance: 18, dailyMin: 24, dailyMax: 26, nftAge: 52, repairPathUSD: 0.60, color: '#2196F3' },
-        { id: 3, name: 'Super Rare', chance: 8,  dailyMin: 27, dailyMax: 30, nftAge: 57, repairPathUSD: 0.80, color: '#E91E63' },
-        { id: 4, name: 'Legendary',  chance: 4,  dailyMin: 31, dailyMax: 35, nftAge: 63, repairPathUSD: 1.00, color: '#FF9800' },
-        { id: 5, name: 'Mythic',     chance: 2,  dailyMin: 36, dailyMax: 42, nftAge: 70, repairPathUSD: 1.50, color: '#9C27B0' },
+        { id: 0, name: 'Common',     chance: 30, dailyMin: 18, dailyMax: 20, nftAge: 19, repairPathUSD: 0.24, color: '#9E9E9E' },
+        { id: 1, name: 'UnCommon',   chance: 30, dailyMin: 21, dailyMax: 23, nftAge: 17, repairPathUSD: 0.40, color: '#4CAF50' },
+        { id: 2, name: 'Rare',       chance: 18, dailyMin: 24, dailyMax: 26, nftAge: 15, repairPathUSD: 0.60, color: '#2196F3' },
+        { id: 3, name: 'Super Rare', chance: 8,  dailyMin: 27, dailyMax: 30, nftAge: 14, repairPathUSD: 0.80, color: '#E91E63' },
+        { id: 4, name: 'Legendary',  chance: 4,  dailyMin: 31, dailyMax: 35, nftAge: 13, repairPathUSD: 1.00, color: '#FF9800' },
+        { id: 5, name: 'Mythic',     chance: 2,  dailyMin: 36, dailyMax: 42, nftAge: 11, repairPathUSD: 1.50, color: '#9C27B0' },
     ],
 };
 
