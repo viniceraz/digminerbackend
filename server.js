@@ -108,6 +108,7 @@ const CONFIG = {
     LAND_BOX_PRICE_DIGCOIN: 300,       // 3 pathUSD
     LAND_BOX_BULK_QUANTITY: 10,
     LAND_BOX_BULK_PRICE_DIGCOIN: 2550, // 10 boxes = 15% off (25.50 pathUSD)
+    LAND_BOX_MAX_SUPPLY: 1000,         // total land boxes ever mintable
     LAND_RARITIES: [
         { id: 0, name: 'Common',     chance: 35, boostPercent: 5,  minerSlots: 2, color: '#9E9E9E' },
         { id: 1, name: 'UnCommon',   chance: 28, boostPercent: 10, minerSlots: 3, color: '#4CAF50' },
@@ -526,6 +527,16 @@ async function buyLandBox(wallet, quantity = 1) {
     }
     const qty = quantity === CONFIG.LAND_BOX_BULK_QUANTITY ? CONFIG.LAND_BOX_BULK_QUANTITY : 1;
     const cost = qty === CONFIG.LAND_BOX_BULK_QUANTITY ? CONFIG.LAND_BOX_BULK_PRICE_DIGCOIN : CONFIG.LAND_BOX_PRICE_DIGCOIN * qty;
+
+    // Enforce global supply cap — count atomically to prevent race at the limit
+    const { count: totalMinted } = await supabase.from('lands').select('*', { count: 'exact', head: true });
+    const remaining = CONFIG.LAND_BOX_MAX_SUPPLY - (totalMinted || 0);
+    if (remaining <= 0) {
+        return { error: 'All 1000 Mystery Land Boxes have been sold out!' };
+    }
+    if (qty > remaining) {
+        return { error: `Only ${remaining} land box${remaining !== 1 ? 'es' : ''} remaining. Cannot buy ${qty} at once.` };
+    }
 
     const player = await getOrCreatePlayer(w);
     if (player.digcoin_balance < cost) {
@@ -1458,8 +1469,14 @@ app.get('/api/stats', async (req, res) => {
         const { count: totalPlayers } = await supabase.from('players').select('*', { count: 'exact', head: true });
         const { count: totalMiners } = await supabase.from('miners').select('*', { count: 'exact', head: true });
         const { count: aliveMiners } = await supabase.from('miners').select('*', { count: 'exact', head: true }).eq('is_alive', true);
+        const { count: landsMinted } = await supabase.from('lands').select('*', { count: 'exact', head: true });
         const { data: agg } = await supabase.rpc('get_global_stats');
-        res.json({ totalPlayers, totalMiners, aliveMiners, ...(agg?.[0] || {}), landSaleStartMs: LAND_SALE_START_MS });
+        res.json({
+            totalPlayers, totalMiners, aliveMiners, ...(agg?.[0] || {}),
+            landSaleStartMs: LAND_SALE_START_MS,
+            landsMinted: landsMinted || 0,
+            landMaxSupply: CONFIG.LAND_BOX_MAX_SUPPLY,
+        });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
