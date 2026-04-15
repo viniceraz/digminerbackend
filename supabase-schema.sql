@@ -72,13 +72,6 @@ CREATE TABLE IF NOT EXISTS withdrawals (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Migration: add tx_hash to withdrawals for on-chain confirmation tracking
-ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS tx_hash TEXT;
-
--- Migration: enforce idempotency on deposits — prevents double-credit on concurrent
--- calls with the same txHash (UNIQUE ignores NULLs in PostgreSQL, so safe to add)
-CREATE UNIQUE INDEX IF NOT EXISTS idx_deposits_tx_hash_unique ON deposits(tx_hash) WHERE tx_hash IS NOT NULL;
-
 -- Box Purchases
 CREATE TABLE IF NOT EXISTS box_purchases (
     id BIGSERIAL PRIMARY KEY,
@@ -106,6 +99,10 @@ CREATE INDEX IF NOT EXISTS idx_miners_wallet ON miners(wallet);
 CREATE INDEX IF NOT EXISTS idx_miners_alive ON miners(wallet, is_alive);
 CREATE INDEX IF NOT EXISTS idx_play_wallet ON play_history(wallet);
 CREATE INDEX IF NOT EXISTS idx_deposits_wallet ON deposits(wallet);
+
+-- Unique guard: prevents double-credit when two concurrent requests submit the same txHash.
+-- NULL values are excluded (PostgreSQL allows multiple NULLs in a partial unique index).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deposits_tx_hash_unique ON deposits(tx_hash) WHERE tx_hash IS NOT NULL;
 
 -- Global stats function (used by /api/stats)
 CREATE OR REPLACE FUNCTION get_global_stats()

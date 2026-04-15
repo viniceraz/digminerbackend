@@ -209,7 +209,7 @@ async function getOrCreatePlayer(wallet, referrer = null) {
 async function processDeposit(wallet, amountPathUSD, txHash = '') {
     const w = norm(wallet);
 
-    // Prevent double-credit for the same on-chain tx
+    // Fast-path duplicate check (SELECT before INSERT saves a round-trip in the common case)
     if (txHash) {
         const { data: existing } = await supabase.from('deposits').select('id').eq('tx_hash', txHash).limit(1);
         if (existing?.length) {
@@ -221,14 +221,34 @@ async function processDeposit(wallet, amountPathUSD, txHash = '') {
     const player = await getOrCreatePlayer(w);
     const digcoinAmount = amountPathUSD * CONFIG.DIGCOIN_PER_PATHUSD;
 
+    // INSERT the deposit record BEFORE updating the balance.
+    // The UNIQUE index on tx_hash is the real guard against concurrent duplicates:
+    // if two requests race past the SELECT check above, only one INSERT will succeed.
+    // The balance update is only reached after a successful INSERT, so DIGCOIN is
+    // never credited twice for the same on-chain transaction.
+    if (txHash) {
+        const { error: insertErr } = await supabase.from('deposits').insert({
+            wallet: w, amount_pathusd: amountPathUSD, digcoin_credited: digcoinAmount, tx_hash: txHash,
+        });
+        if (insertErr) {
+            // code 23505 = unique_violation — another request already inserted this txHash
+            if (insertErr.code === '23505') {
+                console.log(`⚠️  Duplicate deposit blocked by constraint: ${txHash}`);
+                return { duplicate: true };
+            }
+            throw new Error(insertErr.message);
+        }
+    } else {
+        // No txHash (e.g. admin credit) — insert without unique guard
+        await supabase.from('deposits').insert({
+            wallet: w, amount_pathusd: amountPathUSD, digcoin_credited: digcoinAmount, tx_hash: txHash,
+        });
+    }
+
     await supabase.from('players').update({
         digcoin_balance: player.digcoin_balance + digcoinAmount,
         total_deposited_pathusd: player.total_deposited_pathusd + amountPathUSD,
     }).eq('wallet', w);
-
-    await supabase.from('deposits').insert({
-        wallet: w, amount_pathusd: amountPathUSD, digcoin_credited: digcoinAmount, tx_hash: txHash,
-    });
 
     // Referral: 4%
     if (player.referrer) {
@@ -480,14 +500,13 @@ async function fuseMiner(wallet, minerId1, minerId2) {
         return { error: 'Failed to create fused miner — balance restored, please try again' };
     }
 
-    // Atomically delete both original miners — verify exactly 2 rows deleted.
-    // If a concurrent fuse already consumed one of these miners, fewer than 2 rows
-    // will be deleted. In that case, rollback the new miner and refund DIGCOIN.
+    // Atomically delete both original miners and verify exactly 2 rows were removed.
+    // If a concurrent fuse request already consumed one of them, fewer than 2 rows
+    // will be deleted — in that case we roll back the new miner and refund DIGCOIN.
     const { data: deleted } = await supabase.from('miners')
         .delete().in('id', [minerId1, minerId2]).eq('wallet', w).select('id');
 
     if (!deleted || deleted.length !== 2) {
-        // One or both miners were already consumed by a concurrent request
         await supabase.from('miners').delete().eq('id', newMiner.id);
         const { data: fresh } = await supabase.from('players').select('digcoin_balance, total_spent_digcoin').eq('wallet', w).single();
         await supabase.from('players').update({
@@ -771,23 +790,7 @@ async function startEventListener() {
                             processDeposit(parsed.args.player, amt, log.transactionHash);
                         } else if (parsed.name === 'Withdrawn') {
                             const amt = parseFloat(ethers.formatUnits(parsed.args.amount, CONFIG.PATHUSD_DECIMALS));
-                            const playerAddr = parsed.args.player.toLowerCase();
-                            const onChainNonce = parseInt(parsed.args.nonce.toString());
-                            console.log(`🏧 On-chain Withdraw confirmed: ${amt} pathUSD to ${playerAddr} (nonce: ${onChainNonce})`);
-
-                            // Mark matching 'ready' withdrawal as 'completed'
-                            const { data: confirmed } = await supabase.from('withdrawals')
-                                .update({ status: 'completed', tx_hash: log.transactionHash })
-                                .eq('wallet', playerAddr)
-                                .eq('nonce', onChainNonce)
-                                .eq('status', 'ready')
-                                .select('id, amount_digcoin');
-
-                            if (confirmed?.length) {
-                                console.log(`✅ Withdrawal #${confirmed[0].id} completed on-chain (${confirmed[0].amount_digcoin} DIGCOIN burned, tx: ${log.transactionHash})`);
-                            } else {
-                                console.warn(`⚠️  Withdrawn event for ${playerAddr} nonce ${onChainNonce} — no matching 'ready' record found`);
-                            }
+                            console.log(`🏧 On-chain Withdraw: ${amt} pathUSD to ${parsed.args.player}`);
                         }
                     }
                     lastBlock = current;
@@ -803,96 +806,6 @@ async function startEventListener() {
         console.error('❌ Listener init error:', err.message);
         setTimeout(startEventListener, 30000);
     }
-}
-
-// ════════════════════════════════════════════
-// EXPIRY CHECKER — refunds DIGCOIN for withdrawals
-// whose signature deadline passed without on-chain confirmation
-// ════════════════════════════════════════════
-
-async function startExpiryChecker() {
-    const check = async () => {
-        try {
-            // 'ready' records older than signature deadline + 5-minute safety buffer
-            const expiryMs = (CONFIG.SIGNATURE_DEADLINE_SECS + 300) * 1000;
-            const cutoff = new Date(Date.now() - expiryMs).toISOString();
-
-            const { data: candidates } = await supabase.from('withdrawals')
-                .select('id, wallet, nonce, amount_digcoin, net_pathusd')
-                .eq('status', 'ready')
-                .lt('created_at', cutoff);
-
-            if (!candidates?.length) return;
-
-            console.log(`⏰ Expiry check: ${candidates.length} candidate(s) past deadline`);
-
-            // Single provider instance shared across all checks in this cycle
-            const provider = new ethers.JsonRpcProvider(CONFIG.RPC_URL);
-            const pool = new ethers.Contract(
-                CONFIG.POOL_CONTRACT,
-                ['function getNonce(address) view returns (uint256)'],
-                provider
-            );
-
-            for (const rec of candidates) {
-                // ── CRITICAL: verify on-chain nonce BEFORE any refund ──────────────
-                // If the Withdrawn event was missed (RPC blip, server restart, etc.),
-                // the contract nonce will already be > rec.nonce, meaning pathUSD was
-                // already sent. We must NOT refund in that case.
-                let currentNonce;
-                try {
-                    currentNonce = parseInt((await pool.getNonce(rec.wallet)).toString());
-                } catch (nonceErr) {
-                    // Cannot verify — skip this record and retry next cycle
-                    console.error(`⚠️  Expiry: cannot read on-chain nonce for #${rec.id} (${rec.wallet}) — skipping: ${nonceErr.message}`);
-                    continue;
-                }
-
-                if (currentNonce > rec.nonce) {
-                    // Withdrawal was executed on-chain but event was missed.
-                    // Correct the record without refunding.
-                    await supabase.from('withdrawals')
-                        .update({ status: 'completed' })
-                        .eq('id', rec.id)
-                        .eq('status', 'ready');
-                    console.warn(`⚠️  Expiry: withdrawal #${rec.id} (${rec.wallet}) was completed on-chain but event missed — corrected to 'completed', no refund`);
-                    continue;
-                }
-
-                // Nonce not consumed — safe to refund.
-                // Atomically flip 'ready' → 'expired' (guards against concurrent double-refund)
-                const { data: locked } = await supabase.from('withdrawals')
-                    .update({ status: 'expired' })
-                    .eq('id', rec.id)
-                    .eq('status', 'ready')
-                    .select('id');
-
-                if (!locked?.length) continue; // another process already handled it
-
-                // Restore player DIGCOIN balance
-                const { data: player } = await supabase.from('players')
-                    .select('digcoin_balance, total_withdrawn_pathusd')
-                    .eq('wallet', rec.wallet)
-                    .single();
-
-                if (player) {
-                    await supabase.from('players').update({
-                        digcoin_balance: player.digcoin_balance + rec.amount_digcoin,
-                        total_withdrawn_pathusd: Math.max(0, (player.total_withdrawn_pathusd || 0) - rec.net_pathusd),
-                    }).eq('wallet', rec.wallet);
-
-                    console.log(`💸 Refunded ${rec.amount_digcoin} DIGCOIN → ${rec.wallet} (withdrawal #${rec.id} expired, not executed on-chain)`);
-                }
-            }
-        } catch (e) {
-            console.error('⚠️  Expiry check error:', e.message);
-        }
-        setTimeout(check, 5 * 60 * 1000); // re-run every 5 minutes
-    };
-
-    // First run after 2 minutes to let the server warm up
-    setTimeout(check, 2 * 60 * 1000);
-    console.log('⏰ Withdrawal expiry checker scheduled (runs every 5 min)');
 }
 
 // ════════════════════════════════════════════
@@ -1197,69 +1110,58 @@ app.post('/api/withdraw', financialLimit, checkMaintenance, requireAuth, async (
             return res.status(500).json({ error: 'Failed to reserve withdrawal slot — please try again' });
         }
 
-        // From here: any unhandled exception MUST cancel the pending record.
-        // Without this, an unexpected DB or network error would leave a zombie 'pending'
-        // record that blocks the user for 24h with no recourse.
-        try {
-            // Re-check cooldown to catch concurrent requests that slipped through the initial check.
-            // Look for any non-cancelled withdrawal in the last 24h OTHER than the one we just inserted.
-            const { data: recheck } = await supabase.from('withdrawals')
-                .select('id, created_at').eq('wallet', w).neq('status', 'cancelled').neq('id', pending.id)
-                .order('created_at', { ascending: false }).limit(1);
+        // Re-check cooldown to catch concurrent requests that slipped through the initial check.
+        // Look for any non-cancelled withdrawal in the last 24h OTHER than the one we just inserted.
+        const { data: recheck } = await supabase.from('withdrawals')
+            .select('id, created_at').eq('wallet', w).neq('status', 'cancelled').neq('id', pending.id)
+            .order('created_at', { ascending: false }).limit(1);
 
-            if (recheck?.length) {
-                const elapsed = Date.now() - new Date(recheck[0].created_at).getTime();
-                if (elapsed < COOLDOWN_MS) {
-                    // Race detected — cancel our pending record and return cooldown error
-                    await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id);
-                    const rem = COOLDOWN_MS - elapsed;
-                    const h = Math.floor(rem / 3600000), m = Math.floor((rem % 3600000) / 60000);
-                    return res.status(400).json({ error: `Withdraw cooldown: wait ${h}h ${m}m`, cooldownMs: rem });
-                }
-            }
-
-            // Atomic balance deduction
-            const { data: deducted } = await supabase.from('players')
-                .update({
-                    digcoin_balance: player.digcoin_balance - amount,
-                    total_withdrawn_pathusd: (player.total_withdrawn_pathusd || 0) + net,
-                })
-                .eq('wallet', w)
-                .gte('digcoin_balance', amount)
-                .select('digcoin_balance');
-
-            if (!deducted?.length) {
+        if (recheck?.length) {
+            const elapsed = Date.now() - new Date(recheck[0].created_at).getTime();
+            if (elapsed < COOLDOWN_MS) {
+                // Race detected — cancel our pending record and return cooldown error
                 await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id);
-                return res.status(400).json({ error: 'Insufficient balance (concurrent update conflict — try again)' });
+                const rem = COOLDOWN_MS - elapsed;
+                const h = Math.floor(rem / 3600000), m = Math.floor((rem % 3600000) / 60000);
+                return res.status(400).json({ error: `Withdraw cooldown: wait ${h}h ${m}m`, cooldownMs: rem });
             }
-
-            // Generate signature — if this fails, restore balance and cancel the pending record
-            let sigData;
-            try {
-                sigData = await generateWithdrawSignature(w, amountPathUSD);
-            } catch (sigErr) {
-                await supabase.from('players').update({
-                    digcoin_balance: player.digcoin_balance,
-                    total_withdrawn_pathusd: player.total_withdrawn_pathusd || 0,
-                }).eq('wallet', w);
-                await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id);
-                console.error(`❌ Withdraw signature failed for ${w}, balance restored:`, sigErr.message);
-                return res.status(500).json({ error: 'Failed to generate withdrawal signature — balance restored, please try again' });
-            }
-
-            // Promote pending → ready with the real nonce
-            await supabase.from('withdrawals')
-                .update({ nonce: parseInt(sigData.nonce), status: 'ready' })
-                .eq('id', pending.id);
-
-            res.json({ success: true, amountDigcoin: amount, amountPathUSD, feePathUSD: fee, netPathUSD: net, signature: sigData });
-
-        } catch (innerErr) {
-            // Emergency cleanup: cancel the pending slot so the user is not locked out for 24h
-            try { await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id); } catch (_) {}
-            console.error(`❌ Withdraw inner error for ${w}, pending #${pending.id} cancelled:`, innerErr.message);
-            throw innerErr; // re-throw to outer catch for the 500 response
         }
+
+        // Atomic balance deduction
+        const { data: deducted } = await supabase.from('players')
+            .update({
+                digcoin_balance: player.digcoin_balance - amount,
+                total_withdrawn_pathusd: (player.total_withdrawn_pathusd || 0) + net,
+            })
+            .eq('wallet', w)
+            .gte('digcoin_balance', amount)
+            .select('digcoin_balance');
+
+        if (!deducted?.length) {
+            await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id);
+            return res.status(400).json({ error: 'Insufficient balance (concurrent update conflict — try again)' });
+        }
+
+        // Generate signature — if this fails, restore balance and cancel the pending record
+        let sigData;
+        try {
+            sigData = await generateWithdrawSignature(w, amountPathUSD);
+        } catch (sigErr) {
+            await supabase.from('players').update({
+                digcoin_balance: player.digcoin_balance,
+                total_withdrawn_pathusd: player.total_withdrawn_pathusd || 0,
+            }).eq('wallet', w);
+            await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id);
+            console.error(`❌ Withdraw signature failed for ${w}, balance restored:`, sigErr.message);
+            return res.status(500).json({ error: 'Failed to generate withdrawal signature — balance restored, please try again' });
+        }
+
+        // Promote pending → ready with the real nonce
+        await supabase.from('withdrawals')
+            .update({ nonce: parseInt(sigData.nonce), status: 'ready' })
+            .eq('id', pending.id);
+
+        res.json({ success: true, amountDigcoin: amount, amountPathUSD, feePathUSD: fee, netPathUSD: net, signature: sigData });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1271,16 +1173,13 @@ app.get('/api/history/:wallet', requireAuth, async (req, res) => {
         const limit = Math.min(parseInt(req.query.limit) || 50, 100);
         const { data: plays } = await supabase.from('play_history').select('*').eq('wallet', w).order('played_at', { ascending: false }).limit(limit);
         const { data: deps } = await supabase.from('deposits').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(limit);
-        const { data: withs } = await supabase.from('withdrawals').select('*').eq('wallet', w).in('status', ['ready', 'completed', 'expired']).order('created_at', { ascending: false }).limit(limit);
+        const { data: withs } = await supabase.from('withdrawals').select('*').eq('wallet', w).eq('status', 'ready').order('created_at', { ascending: false }).limit(limit);
         const { data: boxes } = await supabase.from('box_purchases').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(limit);
 
         const txs = [
             ...(plays || []).map(p => ({ type: 'play', detail: `Get Reward Miner #${p.miner_id} = ${p.reward_digcoin} DIGCOIN`, amount: p.reward_digcoin, date: p.played_at })),
             ...(deps || []).map(d => ({ type: 'deposit', detail: `Deposit ${d.amount_pathusd} pathUSD = ${d.digcoin_credited} DIGCOIN`, amount: d.digcoin_credited, date: d.created_at })),
-            ...(withs || []).map(w => {
-                const statusLabel = w.status === 'completed' ? '✅ confirmed' : w.status === 'expired' ? '❌ expired (refunded)' : '⏳ pending confirmation';
-                return { type: 'withdraw', detail: `Withdraw ${w.amount_digcoin} DIGCOIN = ${w.net_pathusd} pathUSD (fee: ${w.fee_pathusd}) [${statusLabel}]`, amount: -w.amount_digcoin, date: w.created_at, status: w.status, txHash: w.tx_hash || null };
-            }),
+            ...(withs || []).map(w => ({ type: 'withdraw', detail: `Withdraw ${w.amount_digcoin} DIGCOIN = ${w.net_pathusd} pathUSD (fee: ${w.fee_pathusd})`, amount: -w.amount_digcoin, date: w.created_at })),
             ...(boxes || []).map(b => ({ type: 'box', detail: `Buy Box → Miner #${b.miner_id}`, amount: -b.cost_digcoin, date: b.created_at })),
         ].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, limit);
 
@@ -1394,10 +1293,7 @@ app.get('/api/config', (req, res) => {
 
 app.listen(CONFIG.PORT, () => {
     console.log(`\n  ⛏️  DigMiner Backend (Supabase)\n  Port: ${CONFIG.PORT} | Play All Fee: ${CONFIG.PLAY_ALL_FEE_DIGCOIN} DIGCOIN/miner\n`);
-    if (CONFIG.POOL_CONTRACT) {
-        startEventListener();
-        startExpiryChecker();
-    }
+    if (CONFIG.POOL_CONTRACT) startEventListener();
 });
 
 module.exports = app;
