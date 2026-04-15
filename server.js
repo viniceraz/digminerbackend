@@ -120,7 +120,7 @@ const CONFIG = {
 };
 
 // Land sale opens 240 minutes after first server boot (persists for the process lifetime)
-const LAND_SALE_START_MS = Date.now() + 240 * 60 * 1000;
+const LAND_SALE_START_MS = 1776296008834; // Fixed: 2026-04-15T23:33:28 UTC — does not reset on server restart
 
 // ════════════════════════════════════════════
 // AUTH (EIP-191 wallet signatures)
