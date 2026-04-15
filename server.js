@@ -103,7 +103,23 @@ const CONFIG = {
         { id: 4, name: 'Legendary',  chance: 4,  dailyMin: 31, dailyMax: 35, nftAge: 13, repairPathUSD: 1.00, color: '#FF9800' },
         { id: 5, name: 'Mythic',     chance: 2,  dailyMin: 36, dailyMax: 42, nftAge: 11, repairPathUSD: 1.50, color: '#9C27B0' },
     ],
+
+    // ── Lands ──────────────────────────────────────────
+    LAND_BOX_PRICE_DIGCOIN: 300,       // 3 pathUSD
+    LAND_BOX_BULK_QUANTITY: 10,
+    LAND_BOX_BULK_PRICE_DIGCOIN: 2550, // 10 boxes = 15% off (25.50 pathUSD)
+    LAND_RARITIES: [
+        { id: 0, name: 'Common',     chance: 35, boostPercent: 5,  minerSlots: 2, color: '#9E9E9E' },
+        { id: 1, name: 'UnCommon',   chance: 28, boostPercent: 10, minerSlots: 3, color: '#4CAF50' },
+        { id: 2, name: 'Rare',       chance: 18, boostPercent: 15, minerSlots: 4, color: '#2196F3' },
+        { id: 3, name: 'Super Rare', chance: 10, boostPercent: 20, minerSlots: 5, color: '#E91E63' },
+        { id: 4, name: 'Legendary',  chance: 6,  boostPercent: 25, minerSlots: 6, color: '#FF9800' },
+        { id: 5, name: 'Mythic',     chance: 3,  boostPercent: 35, minerSlots: 8, color: '#9C27B0' },
+    ],
 };
+
+// Land sale opens 240 minutes after first server boot (persists for the process lifetime)
+const LAND_SALE_START_MS = Date.now() + 240 * 60 * 1000;
 
 // ════════════════════════════════════════════
 // AUTH (EIP-191 wallet signatures)
@@ -171,6 +187,13 @@ function rollRarity() {
     let c = 0;
     for (const r of CONFIG.RARITIES) { c += r.chance; if (roll < c) return r; }
     return CONFIG.RARITIES[0];
+}
+
+function rollLandRarity() {
+    const roll = Math.random() * 100;
+    let c = 0;
+    for (const r of CONFIG.LAND_RARITIES) { c += r.chance; if (roll < c) return r; }
+    return CONFIG.LAND_RARITIES[0];
 }
 
 function generateStats(rarity) {
@@ -476,6 +499,12 @@ async function fuseMiner(wallet, minerId1, minerId2) {
         return { error: 'Fuse failed — one of the miners was already used in a concurrent request. Balance restored.' };
     }
 
+    await supabase.from('activity_log').insert({
+        wallet: w, type: 'fusion',
+        detail: `Fused #${minerId1}(${m1.rarity_name}) + #${minerId2}(${m2.rarity_name}) → #${newMiner.id}(${rarity.name})`,
+        amount_digcoin: cost,
+    });
+
     console.log(`🔥 Fuse: ${w} fused #${minerId1}(${m1.rarity_name}) + #${minerId2}(${m2.rarity_name}) → #${newMiner.id}(${rarity.name})`);
 
     return {
@@ -484,6 +513,148 @@ async function fuseMiner(wallet, minerId1, minerId2) {
         consumed: [minerId1, minerId2],
         cost,
     };
+}
+
+// ════════════════════════════════════════════
+// LANDS
+// ════════════════════════════════════════════
+
+async function buyLandBox(wallet, quantity = 1) {
+    const w = norm(wallet);
+    if (Date.now() < LAND_SALE_START_MS) {
+        return { error: 'Land sale has not started yet. Check the countdown timer!' };
+    }
+    const qty = quantity === CONFIG.LAND_BOX_BULK_QUANTITY ? CONFIG.LAND_BOX_BULK_QUANTITY : 1;
+    const cost = qty === CONFIG.LAND_BOX_BULK_QUANTITY ? CONFIG.LAND_BOX_BULK_PRICE_DIGCOIN : CONFIG.LAND_BOX_PRICE_DIGCOIN * qty;
+
+    const player = await getOrCreatePlayer(w);
+    if (player.digcoin_balance < cost) {
+        return { error: `Insufficient balance. Need ${cost} DIGCOIN (have ${player.digcoin_balance.toFixed(2)})` };
+    }
+    const { data: ok } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: cost });
+    if (!ok) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
+
+    const lands = [];
+    const insertedLandIds = [];
+    try {
+        for (let i = 0; i < qty; i++) {
+            const rarity = rollLandRarity();
+            const { data: land, error: landErr } = await supabase.from('lands').insert({
+                wallet: w, rarity_id: rarity.id, rarity_name: rarity.name,
+                boost_percent: rarity.boostPercent, miner_slots: rarity.minerSlots,
+            }).select().single();
+
+            if (landErr || !land) throw new Error(landErr?.message || 'Failed to create land');
+
+            insertedLandIds.push(land.id);
+            await supabase.from('land_purchases').insert({ wallet: w, land_id: land.id, cost_digcoin: CONFIG.LAND_BOX_PRICE_DIGCOIN });
+
+            lands.push({
+                id: land.id, rarityId: rarity.id, rarityName: rarity.name,
+                boostPercent: rarity.boostPercent, minerSlots: rarity.minerSlots, color: rarity.color,
+                assignedMiners: [],
+            });
+        }
+    } catch (insertErr) {
+        // Rollback: delete orphaned lands + refund
+        if (insertedLandIds.length > 0) {
+            await supabase.from('land_purchases').delete().in('land_id', insertedLandIds);
+            await supabase.from('lands').delete().in('id', insertedLandIds);
+        }
+        const { error: refundErr } = await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: cost });
+        if (refundErr) console.error(`❌ buyLandBox REFUND FAILED for ${w} (${cost} DC): ${refundErr.message}`);
+        return { error: 'Failed to create land — balance restored, please try again' };
+    }
+
+    console.log(`🌍 Land box(es) bought: ${w} × ${qty} (cost: ${cost} DC)`);
+    return { success: true, lands, cost };
+}
+
+async function getLands(wallet) {
+    const w = norm(wallet);
+    const { data: lands } = await supabase.from('lands').select('*').eq('wallet', w).order('created_at', { ascending: false });
+    if (!lands?.length) return { lands: [] };
+
+    const landIds = lands.map(l => l.id);
+    const { data: assignments } = await supabase
+        .from('land_miners')
+        .select('land_id, miner_id, miners(id, rarity_id, rarity_name, daily_digcoin, last_play_at, is_alive, needs_repair)')
+        .in('land_id', landIds);
+
+    const assignmentsByLand = {};
+    for (const a of assignments || []) {
+        if (!assignmentsByLand[a.land_id]) assignmentsByLand[a.land_id] = [];
+        assignmentsByLand[a.land_id].push(a);
+    }
+
+    return {
+        lands: lands.map(l => {
+            const rarity = CONFIG.LAND_RARITIES[l.rarity_id];
+            return {
+                id: l.id, rarityId: l.rarity_id, rarityName: l.rarity_name,
+                boostPercent: l.boost_percent, minerSlots: l.miner_slots,
+                color: rarity?.color || '#9E9E9E',
+                assignedMiners: (assignmentsByLand[l.id] || []).map(a => {
+                    const m = a.miners;
+                    return {
+                        minerId: a.miner_id,
+                        rarityId: m?.rarity_id,
+                        rarityName: m?.rarity_name,
+                        dailyDigcoin: m?.daily_digcoin,
+                        isIdle: !m?.last_play_at,
+                        isAlive: m?.is_alive,
+                        needsRepair: m?.needs_repair,
+                    };
+                }),
+            };
+        }),
+    };
+}
+
+async function assignMinerToLand(wallet, landId, minerId) {
+    const w = norm(wallet);
+
+    const [{ data: land }, { data: miner }] = await Promise.all([
+        supabase.from('lands').select('*').eq('id', landId).eq('wallet', w).single(),
+        supabase.from('miners').select('*').eq('id', minerId).eq('wallet', w).single(),
+    ]);
+
+    if (!land) return { error: 'Land not found' };
+    if (!miner) return { error: 'Miner not found' };
+    if (!miner.is_alive || miner.needs_repair) return { error: 'Miner must be alive to assign to a land' };
+    if (miner.last_play_at) return { error: 'Miner must be IDLE to assign to a land. Claim or wait for mining to finish.' };
+
+    // Atomic: slot count check + insert in one DB transaction (prevents TOCTOU overflow)
+    const { data: rpcResult, error: rpcErr } = await supabase.rpc('assign_miner_to_land', {
+        p_land_id: landId, p_miner_id: minerId, p_wallet: w,
+    });
+    if (rpcErr) return { error: `Failed to assign: ${rpcErr.message}` };
+    if (rpcResult === 'full') return { error: `Land is full (max ${land.miner_slots} miners). Unassign one first.` };
+    if (rpcResult === 'already_assigned') return { error: 'Miner is already assigned to a land' };
+    if (rpcResult !== 'assigned') return { error: 'Failed to assign miner to land' };
+
+    return { success: true };
+}
+
+async function unassignMinerFromLand(wallet, minerId) {
+    const w = norm(wallet);
+
+    const { data: assignment } = await supabase
+        .from('land_miners')
+        .select('id, miners(last_play_at)')
+        .eq('miner_id', minerId)
+        .eq('wallet', w)
+        .single();
+
+    if (!assignment) return { error: 'Assignment not found' };
+    if (assignment.miners?.last_play_at) {
+        return { error: 'Miner must be IDLE to unassign from land. Claim rewards first.' };
+    }
+
+    const { error: deleteErr } = await supabase.from('land_miners').delete().eq('miner_id', minerId).eq('wallet', w);
+    if (deleteErr) return { error: `Failed to unassign: ${deleteErr.message}` };
+
+    return { success: true };
 }
 
 // Start mining: idle miner → sets last_play_at = NOW, no reward yet
@@ -526,7 +697,14 @@ async function claimMiner(wallet, minerId) {
         return { error: `Wait ${h}h ${m}m ${s}s`, cooldown: rem };
     }
 
-    const reward = miner.daily_digcoin;
+    // Apply land boost if miner is assigned to a land
+    const { data: landAsgn } = await supabase.from('land_miners').select('land_id').eq('miner_id', minerId).single();
+    let boostPercent = 0;
+    if (landAsgn) {
+        const { data: land } = await supabase.from('lands').select('boost_percent').eq('id', landAsgn.land_id).single();
+        if (land) boostPercent = land.boost_percent;
+    }
+    const reward = Math.round(miner.daily_digcoin * (1 + boostPercent / 100) * 100) / 100;
     const newAge = miner.nft_age_remaining - 1;
     const isDead = newAge <= 0;
 
@@ -558,7 +736,7 @@ async function claimMiner(wallet, minerId) {
 
     await supabase.from('play_history').insert({ wallet: w, miner_id: minerId, reward_digcoin: reward });
 
-    return { success: true, reward, nftAgeRemaining: newAge, minerDead: isDead };
+    return { success: true, reward, nftAgeRemaining: newAge, minerDead: isDead, boostPercent };
 }
 
 // Play All: start all idle miners (last_play_at IS NULL)
@@ -590,6 +768,12 @@ async function playAll(wallet) {
         if (refundErr) console.error(`❌ playAll REFUND FAILED for ${w} (${totalFee} DC): ${refundErr.message}`);
         throw new Error(`Failed to start miners: ${startErr.message}`);
     }
+
+    await supabase.from('activity_log').insert({
+        wallet: w, type: 'play_all',
+        detail: `Play All — started ${miners.length} miner${miners.length !== 1 ? 's' : ''}`,
+        amount_digcoin: totalFee,
+    });
 
     return { success: true, started: miners.length, fee: totalFee };
 }
@@ -645,6 +829,14 @@ async function claimAll(wallet) {
     if (refund > 0) {
         const { error: refundErr } = await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: refund });
         if (refundErr) console.error(`❌ claimAll REFUND FAILED for ${w} (${refund} DC): ${refundErr.message}`);
+    }
+
+    if (claimed > 0) {
+        await supabase.from('activity_log').insert({
+            wallet: w, type: 'claim_all',
+            detail: `Claim All — ${claimed} miner${claimed !== 1 ? 's' : ''} claimed, fee ${actualFee} DC, reward ${Math.round(totalReward * 100) / 100} DC`,
+            amount_digcoin: actualFee,
+        });
     }
 
     return {
@@ -843,6 +1035,7 @@ app.get('/api/player/:wallet', async (req, res) => {
                 isIdle, isMining, canClaim,
                 canPlay: canClaim, // backward compat alias
                 cooldownRemaining,
+                miningEndsAt: m.last_play_at ? new Date(m.last_play_at).getTime() + CONFIG.PLAY_COOLDOWN_MS : null,
                 level: m.level, exp: m.exp, power: m.power, energy: m.energy, protective: m.protective, damage: m.damage,
                 repairCostDigcoin: rarity.repairPathUSD * CONFIG.DIGCOIN_PER_PATHUSD,
                 repairCostPathUSD: rarity.repairPathUSD, color: rarity.color,
@@ -1127,16 +1320,27 @@ app.get('/api/history/:wallet', requireAuth, async (req, res) => {
         const w = norm(req.params.wallet);
         if (req.authWallet !== w) return res.status(403).json({ error: 'Cannot view history of another wallet' });
         const limit = Math.min(parseInt(req.query.limit) || 50, 100);
-        const { data: plays } = await supabase.from('play_history').select('*').eq('wallet', w).order('played_at', { ascending: false }).limit(limit);
-        const { data: deps } = await supabase.from('deposits').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(limit);
-        const { data: withs } = await supabase.from('withdrawals').select('*').eq('wallet', w).eq('status', 'ready').order('created_at', { ascending: false }).limit(limit);
-        const { data: boxes } = await supabase.from('box_purchases').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(limit);
+        const [
+            { data: plays }, { data: deps }, { data: withs }, { data: boxes },
+            { data: repairs }, { data: landBuys }, { data: actLog },
+        ] = await Promise.all([
+            supabase.from('play_history').select('*').eq('wallet', w).order('played_at', { ascending: false }).limit(limit),
+            supabase.from('deposits').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(limit),
+            supabase.from('withdrawals').select('*').eq('wallet', w).eq('status', 'ready').order('created_at', { ascending: false }).limit(limit),
+            supabase.from('box_purchases').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(limit),
+            supabase.from('repairs').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(limit),
+            supabase.from('land_purchases').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(limit),
+            supabase.from('activity_log').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(limit),
+        ]);
 
         const txs = [
-            ...(plays || []).map(p => ({ type: 'play', detail: `Get Reward Miner #${p.miner_id} = ${p.reward_digcoin} DIGCOIN`, amount: p.reward_digcoin, date: p.played_at })),
-            ...(deps || []).map(d => ({ type: 'deposit', detail: `Deposit ${d.amount_pathusd} pathUSD = ${d.digcoin_credited} DIGCOIN`, amount: d.digcoin_credited, date: d.created_at })),
-            ...(withs || []).map(w => ({ type: 'withdraw', detail: `Withdraw ${w.amount_digcoin} DIGCOIN = ${w.net_pathusd} pathUSD (fee: ${w.fee_pathusd})`, amount: -w.amount_digcoin, date: w.created_at })),
-            ...(boxes || []).map(b => ({ type: 'box', detail: `Buy Box → Miner #${b.miner_id}`, amount: -b.cost_digcoin, date: b.created_at })),
+            ...(plays    || []).map(p => ({ type: 'claim',      detail: `Claim Miner #${p.miner_id} → +${p.reward_digcoin} DC`,                                                      amount:  p.reward_digcoin,  date: p.played_at    })),
+            ...(deps     || []).map(d => ({ type: 'deposit',    detail: `Deposit ${d.amount_pathusd} pathUSD → +${d.digcoin_credited} DC`,                                            amount:  d.digcoin_credited, date: d.created_at   })),
+            ...(withs    || []).map(w => ({ type: 'withdraw',   detail: `Withdraw ${w.amount_digcoin} DC → ${w.net_pathusd} pathUSD (fee: ${w.fee_pathusd})`,                         amount: -w.amount_digcoin,  date: w.created_at   })),
+            ...(boxes    || []).map(b => ({ type: 'box',        detail: `Buy Miner Box → Miner #${b.miner_id}${b.box_type === 'sale' ? ' (Sale)' : ''}`,                             amount: -b.cost_digcoin,    date: b.created_at   })),
+            ...(repairs  || []).map(r => ({ type: 'repair',     detail: `Repair Miner #${r.miner_id}`,                                                                               amount: -r.cost_digcoin,    date: r.created_at   })),
+            ...(landBuys || []).map(l => ({ type: 'land',       detail: `Buy Land Box${l.land_id ? ` → Land #${l.land_id}` : ''}`,                                                  amount: -l.cost_digcoin,    date: l.created_at   })),
+            ...(actLog   || []).map(a => ({ type: a.type,       detail: a.detail,                                                                                                    amount: -a.amount_digcoin,  date: a.created_at   })),
         ].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, limit);
 
         res.json({ transactions: txs });
@@ -1200,6 +1404,54 @@ app.get('/api/admin/players', requireAdmin, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ════════════════════════════════════════════
+// LAND ROUTES
+// ════════════════════════════════════════════
+
+// Buy Land Box (1 or 10)
+app.post('/api/land/buy', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
+    try {
+        const { wallet, quantity } = req.body;
+        if (!wallet) return res.status(400).json({ error: 'wallet required' });
+        const qty = parseInt(quantity) === CONFIG.LAND_BOX_BULK_QUANTITY ? CONFIG.LAND_BOX_BULK_QUANTITY : 1;
+        const result = await buyLandBox(wallet, qty);
+        if (result.error) return res.status(400).json(result);
+        res.json(result);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Get lands for wallet (public read)
+app.get('/api/land/:wallet', async (req, res) => {
+    try {
+        const raw = req.params.wallet;
+        if (!isValidAddress(raw)) return res.status(400).json({ error: 'Invalid wallet address' });
+        const result = await getLands(raw);
+        res.json(result);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Assign miner to land
+app.post('/api/land/assign', checkMaintenance, requireAuth, async (req, res) => {
+    try {
+        const { wallet, landId, minerId } = req.body;
+        if (!wallet || !landId || !minerId) return res.status(400).json({ error: 'wallet, landId and minerId required' });
+        const result = await assignMinerToLand(wallet, parseInt(landId), parseInt(minerId));
+        if (result.error) return res.status(400).json(result);
+        res.json(result);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Unassign miner from land
+app.post('/api/land/unassign', checkMaintenance, requireAuth, async (req, res) => {
+    try {
+        const { wallet, minerId } = req.body;
+        if (!wallet || !minerId) return res.status(400).json({ error: 'wallet and minerId required' });
+        const result = await unassignMinerFromLand(wallet, parseInt(minerId));
+        if (result.error) return res.status(400).json(result);
+        res.json(result);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Global Stats
 app.get('/api/stats', async (req, res) => {
     try {
@@ -1207,7 +1459,7 @@ app.get('/api/stats', async (req, res) => {
         const { count: totalMiners } = await supabase.from('miners').select('*', { count: 'exact', head: true });
         const { count: aliveMiners } = await supabase.from('miners').select('*', { count: 'exact', head: true }).eq('is_alive', true);
         const { data: agg } = await supabase.rpc('get_global_stats');
-        res.json({ totalPlayers, totalMiners, aliveMiners, ...(agg?.[0] || {}) });
+        res.json({ totalPlayers, totalMiners, aliveMiners, ...(agg?.[0] || {}), landSaleStartMs: LAND_SALE_START_MS });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
