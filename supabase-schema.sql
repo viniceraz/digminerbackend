@@ -121,14 +121,15 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Atomic relative balance increment — prevents lost-update race conditions.
--- All balance ADDITIONS go through this function; deductions keep the .gte() guard.
+-- All balance ADDITIONS go through this function; deductions use spend_digcoin.
 CREATE OR REPLACE FUNCTION add_digcoin(
     p_wallet              TEXT,
     p_amount              DOUBLE PRECISION DEFAULT 0,
     p_deposited_pathusd   DOUBLE PRECISION DEFAULT 0,
     p_earned_digcoin      DOUBLE PRECISION DEFAULT 0,
     p_referral_digcoin    DOUBLE PRECISION DEFAULT 0,
-    p_withdrawn_pathusd   DOUBLE PRECISION DEFAULT 0
+    p_withdrawn_pathusd   DOUBLE PRECISION DEFAULT 0,
+    p_boxes               INTEGER DEFAULT 0
 ) RETURNS void AS $$
 BEGIN
     UPDATE players SET
@@ -136,8 +137,35 @@ BEGIN
         total_deposited_pathusd = total_deposited_pathusd + p_deposited_pathusd,
         total_earned_digcoin    = total_earned_digcoin    + p_earned_digcoin,
         referral_earnings       = referral_earnings       + p_referral_digcoin,
-        total_withdrawn_pathusd = total_withdrawn_pathusd + p_withdrawn_pathusd
+        total_withdrawn_pathusd = total_withdrawn_pathusd + p_withdrawn_pathusd,
+        boxes_bought            = boxes_bought            + p_boxes
     WHERE wallet = p_wallet;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Atomic relative balance deduction — prevents concurrent double-spend.
+-- Returns TRUE if deduction succeeded (balance >= p_amount), FALSE otherwise.
+-- The absolute-SET + .gte() SDK pattern is NOT safe: two concurrent requests both
+-- reading the same stale balance would both pass the check and write the same value,
+-- effectively charging only once. This function uses a relative UPDATE so each
+-- concurrent call deducts from the current live balance.
+CREATE OR REPLACE FUNCTION spend_digcoin(
+    p_wallet              TEXT,
+    p_amount              DOUBLE PRECISION,
+    p_withdrawn_pathusd   DOUBLE PRECISION DEFAULT 0
+) RETURNS BOOLEAN AS $$
+DECLARE
+    rows_updated INTEGER;
+BEGIN
+    UPDATE players SET
+        digcoin_balance         = digcoin_balance - p_amount,
+        total_spent_digcoin     = CASE WHEN p_withdrawn_pathusd = 0
+                                       THEN total_spent_digcoin + p_amount
+                                       ELSE total_spent_digcoin END,
+        total_withdrawn_pathusd = total_withdrawn_pathusd + p_withdrawn_pathusd
+    WHERE wallet = p_wallet AND digcoin_balance >= p_amount;
+    GET DIAGNOSTICS rows_updated = ROW_COUNT;
+    RETURN rows_updated > 0;
 END;
 $$ LANGUAGE plpgsql;
 

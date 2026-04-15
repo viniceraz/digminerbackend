@@ -246,6 +246,7 @@ function makeMockSupabase() {
                     p_earned_digcoin    = 0,
                     p_referral_digcoin  = 0,
                     p_withdrawn_pathusd = 0,
+                    p_boxes             = 0,
                 } = params || {};
                 const p = db.players.find(r => r.wallet === p_wallet);
                 if (p) {
@@ -254,8 +255,26 @@ function makeMockSupabase() {
                     p.total_earned_digcoin    = (p.total_earned_digcoin    || 0) + p_earned_digcoin;
                     p.referral_earnings       = (p.referral_earnings       || 0) + p_referral_digcoin;
                     p.total_withdrawn_pathusd = (p.total_withdrawn_pathusd || 0) + p_withdrawn_pathusd;
+                    p.boxes_bought            = (p.boxes_bought            || 0) + p_boxes;
                 }
                 return Promise.resolve({ data: null, error: null });
+            }
+            if (fn === 'spend_digcoin') {
+                const {
+                    p_wallet,
+                    p_amount            = 0,
+                    p_withdrawn_pathusd = 0,
+                } = params || {};
+                const p = db.players.find(r => r.wallet === p_wallet);
+                if (!p || (p.digcoin_balance || 0) < p_amount) {
+                    return Promise.resolve({ data: false, error: null });
+                }
+                p.digcoin_balance = (p.digcoin_balance || 0) - p_amount;
+                if (p_withdrawn_pathusd === 0) {
+                    p.total_spent_digcoin = (p.total_spent_digcoin || 0) + p_amount;
+                }
+                p.total_withdrawn_pathusd = (p.total_withdrawn_pathusd || 0) + p_withdrawn_pathusd;
+                return Promise.resolve({ data: true, error: null });
             }
             return Promise.resolve({ data: null, error: { message: `Unknown RPC: ${fn}` } });
         },
@@ -983,6 +1002,36 @@ async function run() {
         ok('Race: total_deposited incremented relatively (10 + 2 = 12)', final.total_deposited_pathusd === 12, { got: final.total_deposited_pathusd });
 
         db.players = db.players.filter(p => p.wallet !== raceWallet);
+    }
+
+    {
+        // Simulate the buyBoxes double-spend exploit:
+        // 10 concurrent requests all read balance=1000, all try to buy a box (300 DC each).
+        // With the old absolute-SET pattern all 10 would succeed (only 300 DC deducted).
+        // With spend_digcoin (relative UPDATE) each sees the live balance — exhausts after 3.
+        const exploitWallet = '0xcccccccccccccccccccccccccccccccccccccccc';
+        db.players.push({
+            id: 9903, wallet: exploitWallet,
+            digcoin_balance: 1000, total_deposited_pathusd: 10,
+            total_earned_digcoin: 0, total_spent_digcoin: 0,
+            total_withdrawn_pathusd: 0, boxes_bought: 0, referral_earnings: 0, referrer: null,
+            created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+        });
+
+        const mock3 = makeMockSupabase();
+        const results = await Promise.all(
+            Array.from({ length: 10 }, () =>
+                mock3.rpc('spend_digcoin', { p_wallet: exploitWallet, p_amount: 300 })
+            )
+        );
+        const succeeded = results.filter(r => r.data === true).length;
+        const afterExploit = db.players.find(p => p.wallet === exploitWallet);
+
+        ok('Exploit: only 3 of 10 concurrent buys succeed (floor(1000/300)=3)', succeeded === 3, { succeeded });
+        ok('Exploit: balance = 1000 - (3×300) = 100', afterExploit.digcoin_balance === 100, { got: afterExploit.digcoin_balance });
+        ok('Exploit: total_spent = 3×300 = 900', afterExploit.total_spent_digcoin === 900, { got: afterExploit.total_spent_digcoin });
+
+        db.players = db.players.filter(p => p.wallet !== exploitWallet);
     }
 
     {

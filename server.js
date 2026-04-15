@@ -275,18 +275,9 @@ async function buyBoxes(wallet, quantity = 1) {
         return { error: `Insufficient balance. Need ${cost} DIGCOIN (have ${player.digcoin_balance.toFixed(2)})` };
     }
 
-    // Atomic deduction: only succeeds if balance is still >= cost at write time
-    const { data: deducted } = await supabase.from('players')
-        .update({
-            digcoin_balance: player.digcoin_balance - cost,
-            total_spent_digcoin: player.total_spent_digcoin + cost,
-            boxes_bought: player.boxes_bought + quantity,
-        })
-        .eq('wallet', w)
-        .gte('digcoin_balance', cost)
-        .select('digcoin_balance');
-
-    if (!deducted?.length) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
+    // Atomic relative deduction — safe against concurrent double-spend
+    const { data: ok } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: cost });
+    if (!ok) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
 
     const miners = [];
     try {
@@ -311,13 +302,11 @@ async function buyBoxes(wallet, quantity = 1) {
                 roi: Math.ceil(CONFIG.BOX_PRICE_DIGCOIN / dailyDigcoin),
             });
         }
+        // Increment boxes_bought only after all miners are successfully created
+        await supabase.rpc('add_digcoin', { p_wallet: w, p_boxes: quantity });
     } catch (insertErr) {
-        // Rollback: restore balance since miners were not all created
-        await supabase.from('players').update({
-            digcoin_balance: player.digcoin_balance,
-            total_spent_digcoin: player.total_spent_digcoin,
-            boxes_bought: player.boxes_bought,
-        }).eq('wallet', w);
+        // Rollback: refund balance (boxes_bought was never incremented)
+        await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: cost });
         console.error(`❌ buyBoxes insert failed for ${w}, balance restored:`, insertErr.message);
         return { error: 'Failed to open box — balance restored, please try again' };
     }
@@ -461,14 +450,9 @@ async function fuseMiner(wallet, minerId1, minerId2) {
     if (!player) return { error: 'Player not found' };
     if (player.digcoin_balance < cost) return { error: `Insufficient balance. Need ${cost} DIGCOIN to fuse.` };
 
-    const { data: updated } = await supabase.from('players')
-        .update({ digcoin_balance: player.digcoin_balance - cost, total_spent_digcoin: (player.total_spent_digcoin || 0) + cost })
-        .eq('wallet', w)
-        .gte('digcoin_balance', cost)
-        .select('digcoin_balance')
-        .single();
-
-    if (!updated) return { error: 'Insufficient balance (concurrent update — try again)' };
+    // Atomic relative deduction — safe against concurrent double-spend
+    const { data: fuseOk } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: cost });
+    if (!fuseOk) return { error: 'Insufficient balance (concurrent update — try again)' };
 
     // Determine result rarity
     const highId = Math.max(m1.rarity_id, m2.rarity_id);
@@ -494,9 +478,7 @@ async function fuseMiner(wallet, minerId1, minerId2) {
     }).select().single();
 
     if (insertErr || !newMiner) {
-        // Refund on failure
-        const { data: fresh } = await supabase.from('players').select('digcoin_balance').eq('wallet', w).single();
-        await supabase.from('players').update({ digcoin_balance: (fresh?.digcoin_balance || 0) + cost }).eq('wallet', w);
+        await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: cost });
         return { error: 'Failed to create fused miner — balance restored, please try again' };
     }
 
@@ -610,17 +592,9 @@ async function playAll(wallet) {
         return { error: `Insufficient balance. Need ${totalFee} DIGCOIN (${CONFIG.PLAY_ALL_FEE_DIGCOIN} per miner × ${miners.length} miners)` };
     }
 
-    // Atomic deduction: only succeeds if balance is still >= fee at write time
-    const { data: deducted } = await supabase.from('players')
-        .update({
-            digcoin_balance: player.digcoin_balance - totalFee,
-            total_spent_digcoin: (player.total_spent_digcoin || 0) + totalFee,
-        })
-        .eq('wallet', w)
-        .gte('digcoin_balance', totalFee)
-        .select('digcoin_balance');
-
-    if (!deducted?.length) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
+    // Atomic relative deduction — safe against concurrent double-spend
+    const { data: ok } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: totalFee });
+    if (!ok) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
 
     const now = new Date().toISOString();
     const ids = miners.map(m => m.id);
@@ -649,17 +623,9 @@ async function claimAll(wallet) {
         return { error: `Insufficient balance for Claim All fee. Need ${totalFee} DIGCOIN (${CONFIG.PLAY_ALL_FEE_DIGCOIN} × ${ready.length} miners)` };
     }
 
-    // Atomic fee deduction before crediting rewards, prevents race conditions
-    const { data: feeDeducted } = await supabase.from('players')
-        .update({
-            digcoin_balance: player.digcoin_balance - totalFee,
-            total_spent_digcoin: (player.total_spent_digcoin || 0) + totalFee,
-        })
-        .eq('wallet', w)
-        .gte('digcoin_balance', totalFee)
-        .select('digcoin_balance');
-
-    if (!feeDeducted?.length) return { error: 'Insufficient balance for Claim All fee (concurrent update conflict — try again)' };
+    // Atomic relative deduction — safe against concurrent double-spend
+    const { data: feeOk } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: totalFee });
+    if (!feeOk) return { error: 'Insufficient balance for Claim All fee (concurrent update conflict — try again)' };
 
     let totalReward = 0, claimed = 0, died = 0, failed = 0;
     const details = [];
@@ -706,17 +672,9 @@ async function repairMiner(wallet, minerId) {
         return { error: `Insufficient balance. Repair costs ${cost} DIGCOIN (${rarity.repairPathUSD} pathUSD)` };
     }
 
-    // Atomic deduction before repairing
-    const { data: deducted } = await supabase.from('players')
-        .update({
-            digcoin_balance: player.digcoin_balance - cost,
-            total_spent_digcoin: (player.total_spent_digcoin || 0) + cost,
-        })
-        .eq('wallet', w)
-        .gte('digcoin_balance', cost)
-        .select('digcoin_balance');
-
-    if (!deducted?.length) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
+    // Atomic relative deduction — safe against concurrent double-spend
+    const { data: repairOk } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: cost });
+    if (!repairOk) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
 
     await supabase.from('miners').update({
         nft_age_remaining: miner.nft_age_total, is_alive: true, needs_repair: false,
@@ -1123,17 +1081,11 @@ app.post('/api/withdraw', financialLimit, checkMaintenance, requireAuth, async (
             }
         }
 
-        // Atomic balance deduction
-        const { data: deducted } = await supabase.from('players')
-            .update({
-                digcoin_balance: player.digcoin_balance - amount,
-                total_withdrawn_pathusd: (player.total_withdrawn_pathusd || 0) + net,
-            })
-            .eq('wallet', w)
-            .gte('digcoin_balance', amount)
-            .select('digcoin_balance');
-
-        if (!deducted?.length) {
+        // Atomic relative deduction — safe against concurrent double-spend
+        const { data: withdrawOk } = await supabase.rpc('spend_digcoin', {
+            p_wallet: w, p_amount: amount, p_withdrawn_pathusd: net,
+        });
+        if (!withdrawOk) {
             await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id);
             return res.status(400).json({ error: 'Insufficient balance (concurrent update conflict — try again)' });
         }
