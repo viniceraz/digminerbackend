@@ -72,6 +72,9 @@ CREATE TABLE IF NOT EXISTS withdrawals (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Migration: add tx_hash to withdrawals for on-chain confirmation tracking
+ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS tx_hash TEXT;
+
 -- Box Purchases
 CREATE TABLE IF NOT EXISTS box_purchases (
     id BIGSERIAL PRIMARY KEY,

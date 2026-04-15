@@ -757,7 +757,23 @@ async function startEventListener() {
                             processDeposit(parsed.args.player, amt, log.transactionHash);
                         } else if (parsed.name === 'Withdrawn') {
                             const amt = parseFloat(ethers.formatUnits(parsed.args.amount, CONFIG.PATHUSD_DECIMALS));
-                            console.log(`🏧 On-chain Withdraw: ${amt} pathUSD to ${parsed.args.player}`);
+                            const playerAddr = parsed.args.player.toLowerCase();
+                            const onChainNonce = parseInt(parsed.args.nonce.toString());
+                            console.log(`🏧 On-chain Withdraw confirmed: ${amt} pathUSD to ${playerAddr} (nonce: ${onChainNonce})`);
+
+                            // Mark matching 'ready' withdrawal as 'completed'
+                            const { data: confirmed } = await supabase.from('withdrawals')
+                                .update({ status: 'completed', tx_hash: log.transactionHash })
+                                .eq('wallet', playerAddr)
+                                .eq('nonce', onChainNonce)
+                                .eq('status', 'ready')
+                                .select('id, amount_digcoin');
+
+                            if (confirmed?.length) {
+                                console.log(`✅ Withdrawal #${confirmed[0].id} completed on-chain (${confirmed[0].amount_digcoin} DIGCOIN burned, tx: ${log.transactionHash})`);
+                            } else {
+                                console.warn(`⚠️  Withdrawn event for ${playerAddr} nonce ${onChainNonce} — no matching 'ready' record found`);
+                            }
                         }
                     }
                     lastBlock = current;
@@ -773,6 +789,63 @@ async function startEventListener() {
         console.error('❌ Listener init error:', err.message);
         setTimeout(startEventListener, 30000);
     }
+}
+
+// ════════════════════════════════════════════
+// EXPIRY CHECKER — refunds DIGCOIN for withdrawals
+// whose signature deadline passed without on-chain confirmation
+// ════════════════════════════════════════════
+
+async function startExpiryChecker() {
+    const check = async () => {
+        try {
+            // 'ready' records older than deadline + 5-minute safety buffer
+            const expiryMs = (CONFIG.SIGNATURE_DEADLINE_SECS + 300) * 1000;
+            const cutoff = new Date(Date.now() - expiryMs).toISOString();
+
+            const { data: expired } = await supabase.from('withdrawals')
+                .select('id, wallet, amount_digcoin, net_pathusd')
+                .eq('status', 'ready')
+                .lt('created_at', cutoff);
+
+            if (!expired?.length) return;
+
+            console.log(`⏰ Expiry check: ${expired.length} expired withdrawal(s) to refund`);
+
+            for (const rec of expired) {
+                // Atomically flip status → 'expired' (guards against double-refund)
+                const { data: locked } = await supabase.from('withdrawals')
+                    .update({ status: 'expired' })
+                    .eq('id', rec.id)
+                    .eq('status', 'ready')
+                    .select('id');
+
+                if (!locked?.length) continue; // already handled
+
+                // Restore player balance
+                const { data: player } = await supabase.from('players')
+                    .select('digcoin_balance, total_withdrawn_pathusd')
+                    .eq('wallet', rec.wallet)
+                    .single();
+
+                if (player) {
+                    await supabase.from('players').update({
+                        digcoin_balance: player.digcoin_balance + rec.amount_digcoin,
+                        total_withdrawn_pathusd: Math.max(0, (player.total_withdrawn_pathusd || 0) - rec.net_pathusd),
+                    }).eq('wallet', rec.wallet);
+
+                    console.log(`💸 Refunded ${rec.amount_digcoin} DIGCOIN → ${rec.wallet} (withdrawal #${rec.id} expired without on-chain confirmation)`);
+                }
+            }
+        } catch (e) {
+            console.error('⚠️  Expiry check error:', e.message);
+        }
+        setTimeout(check, 5 * 60 * 1000); // re-run every 5 minutes
+    };
+
+    // First run after 2 minutes to let the server warm up
+    setTimeout(check, 2 * 60 * 1000);
+    console.log('⏰ Withdrawal expiry checker scheduled (runs every 5 min)');
 }
 
 // ════════════════════════════════════════════
@@ -1140,13 +1213,16 @@ app.get('/api/history/:wallet', requireAuth, async (req, res) => {
         const limit = Math.min(parseInt(req.query.limit) || 50, 100);
         const { data: plays } = await supabase.from('play_history').select('*').eq('wallet', w).order('played_at', { ascending: false }).limit(limit);
         const { data: deps } = await supabase.from('deposits').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(limit);
-        const { data: withs } = await supabase.from('withdrawals').select('*').eq('wallet', w).eq('status', 'ready').order('created_at', { ascending: false }).limit(limit);
+        const { data: withs } = await supabase.from('withdrawals').select('*').eq('wallet', w).in('status', ['ready', 'completed', 'expired']).order('created_at', { ascending: false }).limit(limit);
         const { data: boxes } = await supabase.from('box_purchases').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(limit);
 
         const txs = [
             ...(plays || []).map(p => ({ type: 'play', detail: `Get Reward Miner #${p.miner_id} = ${p.reward_digcoin} DIGCOIN`, amount: p.reward_digcoin, date: p.played_at })),
             ...(deps || []).map(d => ({ type: 'deposit', detail: `Deposit ${d.amount_pathusd} pathUSD = ${d.digcoin_credited} DIGCOIN`, amount: d.digcoin_credited, date: d.created_at })),
-            ...(withs || []).map(w => ({ type: 'withdraw', detail: `Withdraw ${w.amount_digcoin} DIGCOIN = ${w.net_pathusd} pathUSD (fee: ${w.fee_pathusd})`, amount: -w.amount_digcoin, date: w.created_at })),
+            ...(withs || []).map(w => {
+                const statusLabel = w.status === 'completed' ? '✅ confirmed' : w.status === 'expired' ? '❌ expired (refunded)' : '⏳ pending confirmation';
+                return { type: 'withdraw', detail: `Withdraw ${w.amount_digcoin} DIGCOIN = ${w.net_pathusd} pathUSD (fee: ${w.fee_pathusd}) [${statusLabel}]`, amount: -w.amount_digcoin, date: w.created_at, status: w.status, txHash: w.tx_hash || null };
+            }),
             ...(boxes || []).map(b => ({ type: 'box', detail: `Buy Box → Miner #${b.miner_id}`, amount: -b.cost_digcoin, date: b.created_at })),
         ].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, limit);
 
@@ -1260,7 +1336,10 @@ app.get('/api/config', (req, res) => {
 
 app.listen(CONFIG.PORT, () => {
     console.log(`\n  ⛏️  DigMiner Backend (Supabase)\n  Port: ${CONFIG.PORT} | Play All Fee: ${CONFIG.PLAY_ALL_FEE_DIGCOIN} DIGCOIN/miner\n`);
-    if (CONFIG.POOL_CONTRACT) startEventListener();
+    if (CONFIG.POOL_CONTRACT) {
+        startEventListener();
+        startExpiryChecker();
+    }
 });
 
 module.exports = app;
