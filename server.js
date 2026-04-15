@@ -246,11 +246,16 @@ async function processDeposit(wallet, amountPathUSD, txHash = '') {
     }
 
     // Atomic relative increment — safe against concurrent withdrawal/deposit races
-    await supabase.rpc('add_digcoin', {
+    const { error: creditErr } = await supabase.rpc('add_digcoin', {
         p_wallet: w,
         p_amount: digcoinAmount,
         p_deposited_pathusd: amountPathUSD,
     });
+    if (creditErr) {
+        console.error(`❌ add_digcoin failed for ${w} (${digcoinAmount} DC): ${creditErr.message} [code: ${creditErr.code}]`);
+        if (txHash) await supabase.from('deposits').delete().eq('tx_hash', txHash);
+        throw new Error(`Credit failed: ${creditErr.message}`);
+    }
 
     // Referral: 4%
     if (player.referrer) {
