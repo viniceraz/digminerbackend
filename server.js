@@ -89,7 +89,7 @@ const CONFIG = {
     SALE_BOX_MAX_TOTAL: 2000,           // global supply cap
     SALE_BOX_MAX_PER_WALLET: 50,        // per-wallet cap
     SALE_BOX_END_TIME: 0, // sale permanently closed
-    WITHDRAW_FEE_PERCENT: 10,
+    WITHDRAW_FEE_PERCENT: 6,
     REFERRAL_PERCENT: 4,
     PLAY_COOLDOWN_MS: 24 * 60 * 60 * 1000,
     PLAY_ALL_FEE_DIGCOIN: 10,     // fee per miner when using Play All / Claim All
