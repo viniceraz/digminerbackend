@@ -408,6 +408,16 @@ async function fuseMiner(wallet, minerId1, minerId2) {
     if (!m1) return { error: 'Miner #' + minerId1 + ' not found' };
     if (!m2) return { error: 'Miner #' + minerId2 + ' not found' };
 
+    // Both must be same rarity
+    if (m1.rarity_id !== m2.rarity_id) return { error: 'Both miners must be the same rarity to fuse.' };
+
+    // Cannot fuse Mythic (highest tier — no tier above)
+    if (m1.rarity_id >= 5) return { error: 'Mythic miners are already the highest tier and cannot be fused.' };
+
+    // Cannot fuse already-fused miners
+    if (m1.is_fused) return { error: `Miner #${minerId1} is already a Fused miner and cannot be fused again.` };
+    if (m2.is_fused) return { error: `Miner #${minerId2} is already a Fused miner and cannot be fused again.` };
+
     // Both must be idle (not currently mining)
     if (m1.last_play_at) return { error: 'Miner #' + minerId1 + ' is currently mining. Claim first.' };
     if (m2.last_play_at) return { error: 'Miner #' + minerId2 + ' is currently mining. Claim first.' };
@@ -422,26 +432,28 @@ async function fuseMiner(wallet, minerId1, minerId2) {
     const { data: fuseOk } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: cost });
     if (!fuseOk) return { error: 'Insufficient balance (concurrent update — try again)' };
 
-    // Determine result rarity
-    const highId = Math.max(m1.rarity_id, m2.rarity_id);
-    const sameRarity = m1.rarity_id === m2.rarity_id;
-    // Same rarity: always upgrades at least 1 tier; Different: 80% keep highest, 20% jump 2 tiers
-    const base80 = sameRarity ? Math.min(highId + 1, 5) : highId;
-    const base20 = Math.min(highId + 2, 5);
-    const resultRarityId = Math.random() < 0.80 ? base80 : base20;
-
+    // Result = parent rarity + 1 tier
+    const resultRarityId = m1.rarity_id + 1;
     const rarity = CONFIG.RARITIES[resultRarityId];
-    const dailyDigcoin = randBetween(rarity.dailyMin, rarity.dailyMax);
+
+    // Daily = (parent1 + parent2) × 1.20, rounded to 1 decimal
+    const fusedDaily = Math.round((m1.daily_digcoin + m2.daily_digcoin) * 1.20 * 10) / 10;
+
+    // Lifespan = parent tier's lifespan (not result tier's)
+    const parentRarity = CONFIG.RARITIES[m1.rarity_id];
+    const fusedLifespan = parentRarity.nftAge;
+
     const stats = generateStats(rarity);
 
-    // Create new miner
+    // Create new fused miner
     const { data: newMiner, error: insertErr } = await supabase.from('miners').insert({
         wallet: w,
         rarity_id: rarity.id,
         rarity_name: rarity.name,
-        daily_digcoin: dailyDigcoin,
-        nft_age_total: rarity.nftAge,
-        nft_age_remaining: rarity.nftAge,
+        daily_digcoin: fusedDaily,
+        nft_age_total: fusedLifespan,
+        nft_age_remaining: fusedLifespan,
+        is_fused: true,
         ...stats,
     }).select().single();
 
@@ -827,7 +839,7 @@ app.get('/api/player/:wallet', async (req, res) => {
             return {
                 id: m.id, rarityId: m.rarity_id, rarityName: m.rarity_name,
                 dailyDigcoin: m.daily_digcoin, nftAgeTotal: m.nft_age_total, nftAgeRemaining: m.nft_age_remaining,
-                isAlive: m.is_alive, needsRepair: m.needs_repair,
+                isAlive: m.is_alive, needsRepair: m.needs_repair, isFused: !!m.is_fused,
                 isIdle, isMining, canClaim,
                 canPlay: canClaim, // backward compat alias
                 cooldownRemaining,
