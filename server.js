@@ -741,7 +741,7 @@ async function startEventListener() {
                         if (parsed.name === 'Deposited') {
                             const amt = parseFloat(ethers.formatUnits(parsed.args.amount, CONFIG.PATHUSD_DECIMALS));
                             console.log(`💰 On-chain Deposit: ${amt} pathUSD from ${parsed.args.player}`);
-                            processDeposit(parsed.args.player, amt, log.transactionHash);
+                            await processDeposit(parsed.args.player, amt, log.transactionHash);
                         } else if (parsed.name === 'Withdrawn') {
                             const amt = parseFloat(ethers.formatUnits(parsed.args.amount, CONFIG.PATHUSD_DECIMALS));
                             console.log(`🏧 On-chain Withdraw: ${amt} pathUSD to ${parsed.args.player}`);
