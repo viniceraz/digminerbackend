@@ -75,6 +75,10 @@ CREATE TABLE IF NOT EXISTS withdrawals (
 -- Migration: add tx_hash to withdrawals for on-chain confirmation tracking
 ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS tx_hash TEXT;
 
+-- Migration: enforce idempotency on deposits — prevents double-credit on concurrent
+-- calls with the same txHash (UNIQUE ignores NULLs in PostgreSQL, so safe to add)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deposits_tx_hash_unique ON deposits(tx_hash) WHERE tx_hash IS NOT NULL;
+
 -- Box Purchases
 CREATE TABLE IF NOT EXISTS box_purchases (
     id BIGSERIAL PRIMARY KEY,

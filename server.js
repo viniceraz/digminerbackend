@@ -480,8 +480,22 @@ async function fuseMiner(wallet, minerId1, minerId2) {
         return { error: 'Failed to create fused miner — balance restored, please try again' };
     }
 
-    // Delete the 2 original miners
-    await supabase.from('miners').delete().in('id', [minerId1, minerId2]);
+    // Atomically delete both original miners — verify exactly 2 rows deleted.
+    // If a concurrent fuse already consumed one of these miners, fewer than 2 rows
+    // will be deleted. In that case, rollback the new miner and refund DIGCOIN.
+    const { data: deleted } = await supabase.from('miners')
+        .delete().in('id', [minerId1, minerId2]).eq('wallet', w).select('id');
+
+    if (!deleted || deleted.length !== 2) {
+        // One or both miners were already consumed by a concurrent request
+        await supabase.from('miners').delete().eq('id', newMiner.id);
+        const { data: fresh } = await supabase.from('players').select('digcoin_balance, total_spent_digcoin').eq('wallet', w).single();
+        await supabase.from('players').update({
+            digcoin_balance: (fresh?.digcoin_balance || 0) + cost,
+            total_spent_digcoin: Math.max(0, (fresh?.total_spent_digcoin || 0) - cost),
+        }).eq('wallet', w);
+        return { error: 'Fuse failed — one of the miners was already used in a concurrent request. Balance restored.' };
+    }
 
     console.log(`🔥 Fuse: ${w} fused #${minerId1}(${m1.rarity_name}) + #${minerId2}(${m2.rarity_name}) → #${newMiner.id}(${rarity.name})`);
 
@@ -1183,58 +1197,69 @@ app.post('/api/withdraw', financialLimit, checkMaintenance, requireAuth, async (
             return res.status(500).json({ error: 'Failed to reserve withdrawal slot — please try again' });
         }
 
-        // Re-check cooldown to catch concurrent requests that slipped through the initial check.
-        // Look for any non-cancelled withdrawal in the last 24h OTHER than the one we just inserted.
-        const { data: recheck } = await supabase.from('withdrawals')
-            .select('id, created_at').eq('wallet', w).neq('status', 'cancelled').neq('id', pending.id)
-            .order('created_at', { ascending: false }).limit(1);
-
-        if (recheck?.length) {
-            const elapsed = Date.now() - new Date(recheck[0].created_at).getTime();
-            if (elapsed < COOLDOWN_MS) {
-                // Race detected — cancel our pending record and return cooldown error
-                await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id);
-                const rem = COOLDOWN_MS - elapsed;
-                const h = Math.floor(rem / 3600000), m = Math.floor((rem % 3600000) / 60000);
-                return res.status(400).json({ error: `Withdraw cooldown: wait ${h}h ${m}m`, cooldownMs: rem });
-            }
-        }
-
-        // Atomic balance deduction
-        const { data: deducted } = await supabase.from('players')
-            .update({
-                digcoin_balance: player.digcoin_balance - amount,
-                total_withdrawn_pathusd: (player.total_withdrawn_pathusd || 0) + net,
-            })
-            .eq('wallet', w)
-            .gte('digcoin_balance', amount)
-            .select('digcoin_balance');
-
-        if (!deducted?.length) {
-            await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id);
-            return res.status(400).json({ error: 'Insufficient balance (concurrent update conflict — try again)' });
-        }
-
-        // Generate signature — if this fails, restore balance and cancel the pending record
-        let sigData;
+        // From here: any unhandled exception MUST cancel the pending record.
+        // Without this, an unexpected DB or network error would leave a zombie 'pending'
+        // record that blocks the user for 24h with no recourse.
         try {
-            sigData = await generateWithdrawSignature(w, amountPathUSD);
-        } catch (sigErr) {
-            await supabase.from('players').update({
-                digcoin_balance: player.digcoin_balance,
-                total_withdrawn_pathusd: player.total_withdrawn_pathusd || 0,
-            }).eq('wallet', w);
-            await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id);
-            console.error(`❌ Withdraw signature failed for ${w}, balance restored:`, sigErr.message);
-            return res.status(500).json({ error: 'Failed to generate withdrawal signature — balance restored, please try again' });
+            // Re-check cooldown to catch concurrent requests that slipped through the initial check.
+            // Look for any non-cancelled withdrawal in the last 24h OTHER than the one we just inserted.
+            const { data: recheck } = await supabase.from('withdrawals')
+                .select('id, created_at').eq('wallet', w).neq('status', 'cancelled').neq('id', pending.id)
+                .order('created_at', { ascending: false }).limit(1);
+
+            if (recheck?.length) {
+                const elapsed = Date.now() - new Date(recheck[0].created_at).getTime();
+                if (elapsed < COOLDOWN_MS) {
+                    // Race detected — cancel our pending record and return cooldown error
+                    await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id);
+                    const rem = COOLDOWN_MS - elapsed;
+                    const h = Math.floor(rem / 3600000), m = Math.floor((rem % 3600000) / 60000);
+                    return res.status(400).json({ error: `Withdraw cooldown: wait ${h}h ${m}m`, cooldownMs: rem });
+                }
+            }
+
+            // Atomic balance deduction
+            const { data: deducted } = await supabase.from('players')
+                .update({
+                    digcoin_balance: player.digcoin_balance - amount,
+                    total_withdrawn_pathusd: (player.total_withdrawn_pathusd || 0) + net,
+                })
+                .eq('wallet', w)
+                .gte('digcoin_balance', amount)
+                .select('digcoin_balance');
+
+            if (!deducted?.length) {
+                await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id);
+                return res.status(400).json({ error: 'Insufficient balance (concurrent update conflict — try again)' });
+            }
+
+            // Generate signature — if this fails, restore balance and cancel the pending record
+            let sigData;
+            try {
+                sigData = await generateWithdrawSignature(w, amountPathUSD);
+            } catch (sigErr) {
+                await supabase.from('players').update({
+                    digcoin_balance: player.digcoin_balance,
+                    total_withdrawn_pathusd: player.total_withdrawn_pathusd || 0,
+                }).eq('wallet', w);
+                await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id);
+                console.error(`❌ Withdraw signature failed for ${w}, balance restored:`, sigErr.message);
+                return res.status(500).json({ error: 'Failed to generate withdrawal signature — balance restored, please try again' });
+            }
+
+            // Promote pending → ready with the real nonce
+            await supabase.from('withdrawals')
+                .update({ nonce: parseInt(sigData.nonce), status: 'ready' })
+                .eq('id', pending.id);
+
+            res.json({ success: true, amountDigcoin: amount, amountPathUSD, feePathUSD: fee, netPathUSD: net, signature: sigData });
+
+        } catch (innerErr) {
+            // Emergency cleanup: cancel the pending slot so the user is not locked out for 24h
+            try { await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id); } catch (_) {}
+            console.error(`❌ Withdraw inner error for ${w}, pending #${pending.id} cancelled:`, innerErr.message);
+            throw innerErr; // re-throw to outer catch for the 500 response
         }
-
-        // Promote pending → ready with the real nonce
-        await supabase.from('withdrawals')
-            .update({ nonce: parseInt(sigData.nonce), status: 'ready' })
-            .eq('id', pending.id);
-
-        res.json({ success: true, amountDigcoin: amount, amountPathUSD, feePathUSD: fee, netPathUSD: net, signature: sigData });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
