@@ -799,30 +799,63 @@ async function startEventListener() {
 async function startExpiryChecker() {
     const check = async () => {
         try {
-            // 'ready' records older than deadline + 5-minute safety buffer
+            // 'ready' records older than signature deadline + 5-minute safety buffer
             const expiryMs = (CONFIG.SIGNATURE_DEADLINE_SECS + 300) * 1000;
             const cutoff = new Date(Date.now() - expiryMs).toISOString();
 
-            const { data: expired } = await supabase.from('withdrawals')
-                .select('id, wallet, amount_digcoin, net_pathusd')
+            const { data: candidates } = await supabase.from('withdrawals')
+                .select('id, wallet, nonce, amount_digcoin, net_pathusd')
                 .eq('status', 'ready')
                 .lt('created_at', cutoff);
 
-            if (!expired?.length) return;
+            if (!candidates?.length) return;
 
-            console.log(`⏰ Expiry check: ${expired.length} expired withdrawal(s) to refund`);
+            console.log(`⏰ Expiry check: ${candidates.length} candidate(s) past deadline`);
 
-            for (const rec of expired) {
-                // Atomically flip status → 'expired' (guards against double-refund)
+            // Single provider instance shared across all checks in this cycle
+            const provider = new ethers.JsonRpcProvider(CONFIG.RPC_URL);
+            const pool = new ethers.Contract(
+                CONFIG.POOL_CONTRACT,
+                ['function getNonce(address) view returns (uint256)'],
+                provider
+            );
+
+            for (const rec of candidates) {
+                // ── CRITICAL: verify on-chain nonce BEFORE any refund ──────────────
+                // If the Withdrawn event was missed (RPC blip, server restart, etc.),
+                // the contract nonce will already be > rec.nonce, meaning pathUSD was
+                // already sent. We must NOT refund in that case.
+                let currentNonce;
+                try {
+                    currentNonce = parseInt((await pool.getNonce(rec.wallet)).toString());
+                } catch (nonceErr) {
+                    // Cannot verify — skip this record and retry next cycle
+                    console.error(`⚠️  Expiry: cannot read on-chain nonce for #${rec.id} (${rec.wallet}) — skipping: ${nonceErr.message}`);
+                    continue;
+                }
+
+                if (currentNonce > rec.nonce) {
+                    // Withdrawal was executed on-chain but event was missed.
+                    // Correct the record without refunding.
+                    await supabase.from('withdrawals')
+                        .update({ status: 'completed' })
+                        .eq('id', rec.id)
+                        .eq('status', 'ready');
+                    console.warn(`⚠️  Expiry: withdrawal #${rec.id} (${rec.wallet}) was completed on-chain but event missed — corrected to 'completed', no refund`);
+                    continue;
+                }
+
+                // Nonce not consumed — safe to refund.
+                // Atomically flip 'ready' → 'expired' (guards against concurrent double-refund)
                 const { data: locked } = await supabase.from('withdrawals')
                     .update({ status: 'expired' })
                     .eq('id', rec.id)
                     .eq('status', 'ready')
                     .select('id');
 
-                if (!locked?.length) continue; // already handled
+                if (!locked?.length) continue; // another process already handled it
 
-                // Restore player balance
+                // Restore player DIGCOIN balance
                 const { data: player } = await supabase.from('players')
                     .select('digcoin_balance, total_withdrawn_pathusd')
                     .eq('wallet', rec.wallet)
@@ -834,7 +867,7 @@ async function startExpiryChecker() {
                         total_withdrawn_pathusd: Math.max(0, (player.total_withdrawn_pathusd || 0) - rec.net_pathusd),
                     }).eq('wallet', rec.wallet);
 
-                    console.log(`💸 Refunded ${rec.amount_digcoin} DIGCOIN → ${rec.wallet} (withdrawal #${rec.id} expired without on-chain confirmation)`);
+                    console.log(`💸 Refunded ${rec.amount_digcoin} DIGCOIN → ${rec.wallet} (withdrawal #${rec.id} expired, not executed on-chain)`);
                 }
             }
         } catch (e) {
