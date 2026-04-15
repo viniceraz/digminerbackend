@@ -253,8 +253,6 @@ async function processDeposit(wallet, amountPathUSD, txHash = '') {
     });
     if (creditErr) {
         console.error(`❌ add_digcoin failed for ${w} (${digcoinAmount} DC): ${creditErr.message} [code: ${creditErr.code}]`);
-        if (txHash) await supabase.from('deposits').delete().eq('tx_hash', txHash);
-        throw new Error(`Credit failed: ${creditErr.message}`);
     }
 
     // Referral: 4%
