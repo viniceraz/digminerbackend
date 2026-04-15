@@ -336,33 +336,17 @@ async function buySaleBoxes(wallet, quantity = 1) {
         return { error: `Insufficient balance. Need ${cost} DIGCOIN (have ${player.digcoin_balance.toFixed(2)})` };
     }
 
-    // Atomic balance deduction
-    const { data: deducted } = await supabase.from('players')
-        .update({
-            digcoin_balance: player.digcoin_balance - cost,
-            total_spent_digcoin: player.total_spent_digcoin + cost,
-            boxes_bought: player.boxes_bought + quantity,
-        })
-        .eq('wallet', w)
-        .gte('digcoin_balance', cost)
-        .select('digcoin_balance');
-
-    if (!deducted?.length) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
+    // Atomic relative deduction — safe against concurrent double-spend
+    const { data: deducted } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: cost });
+    if (!deducted) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
 
     // Check 2 — post-deduction re-check to close TOCTOU window on sale limits
     // (concurrent requests may have both passed Check 1 before either inserted box_purchases)
     const { totalSold: totalSold2, walletBought: walletBought2 } = await getSaleBoxCounts(w);
     if (totalSold2 > CONFIG.SALE_BOX_MAX_TOTAL || walletBought2 > CONFIG.SALE_BOX_MAX_PER_WALLET) {
         // Re-fetch fresh balance to avoid stale-snapshot corruption on refund
-        const { data: fresh } = await supabase.from('players')
-            .select('digcoin_balance, total_spent_digcoin, boxes_bought').eq('wallet', w).single();
-        if (fresh) {
-            await supabase.from('players').update({
-                digcoin_balance: fresh.digcoin_balance + cost,
-                total_spent_digcoin: fresh.total_spent_digcoin - cost,
-                boxes_bought: fresh.boxes_bought - quantity,
-            }).eq('wallet', w);
-        }
+        const { error: refundErr } = await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: cost });
+        if (refundErr) console.error(`❌ buySaleBoxes limit-exceeded REFUND FAILED for ${w} (${cost} DC): ${refundErr.message}`);
         return { error: 'Sale box limit exceeded (concurrent purchase) — balance restored, try again' };
     }
 
@@ -397,16 +381,8 @@ async function buySaleBoxes(wallet, quantity = 1) {
             await supabase.from('box_purchases').delete().in('miner_id', insertedMinerIds).eq('box_type', 'sale');
             await supabase.from('miners').delete().in('id', insertedMinerIds);
         }
-        // Re-fetch fresh balance to avoid stale-snapshot corruption on refund
-        const { data: fresh } = await supabase.from('players')
-            .select('digcoin_balance, total_spent_digcoin, boxes_bought').eq('wallet', w).single();
-        if (fresh) {
-            await supabase.from('players').update({
-                digcoin_balance: fresh.digcoin_balance + cost,
-                total_spent_digcoin: fresh.total_spent_digcoin - cost,
-                boxes_bought: fresh.boxes_bought - quantity,
-            }).eq('wallet', w);
-        }
+        const { error: refundErr } = await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: cost });
+        if (refundErr) console.error(`❌ buySaleBoxes REFUND FAILED for ${w} (${cost} DC): ${refundErr.message}`);
         console.error(`❌ buySaleBoxes insert failed for ${w}, balance restored:`, insertErr.message);
         return { error: 'Failed to open sale box — balance restored, please try again' };
     }
@@ -483,11 +459,8 @@ async function fuseMiner(wallet, minerId1, minerId2) {
 
     if (!deleted || deleted.length !== 2) {
         await supabase.from('miners').delete().eq('id', newMiner.id);
-        const { data: fresh } = await supabase.from('players').select('digcoin_balance, total_spent_digcoin').eq('wallet', w).single();
-        await supabase.from('players').update({
-            digcoin_balance: (fresh?.digcoin_balance || 0) + cost,
-            total_spent_digcoin: Math.max(0, (fresh?.total_spent_digcoin || 0) - cost),
-        }).eq('wallet', w);
+        const { error: refundErr } = await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: cost });
+        if (refundErr) console.error(`❌ fuse race-condition REFUND FAILED for ${w} (${cost} DC): ${refundErr.message}`);
         return { error: 'Fuse failed — one of the miners was already used in a concurrent request. Balance restored.' };
     }
 
@@ -597,7 +570,14 @@ async function playAll(wallet) {
 
     const now = new Date().toISOString();
     const ids = miners.map(m => m.id);
-    await supabase.from('miners').update({ last_play_at: now }).in('id', ids);
+    const { error: startErr } = await supabase.from('miners').update({ last_play_at: now }).in('id', ids);
+
+    if (startErr) {
+        // Refund fee since miners were not started
+        const { error: refundErr } = await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: totalFee });
+        if (refundErr) console.error(`❌ playAll REFUND FAILED for ${w} (${totalFee} DC): ${refundErr.message}`);
+        throw new Error(`Failed to start miners: ${startErr.message}`);
+    }
 
     return { success: true, started: miners.length, fee: totalFee };
 }
@@ -630,15 +610,21 @@ async function claimAll(wallet) {
     const details = [];
 
     for (const miner of ready) {
-        const result = await claimMiner(w, miner.id);
-        if (result.success) {
-            totalReward += result.reward;
-            claimed++;
-            if (result.minerDead) died++;
-        } else {
+        try {
+            const result = await claimMiner(w, miner.id);
+            if (result.success) {
+                totalReward += result.reward;
+                claimed++;
+                if (result.minerDead) died++;
+            } else {
+                failed++;
+            }
+            details.push({ minerId: miner.id, rarityName: miner.rarity_name, ...result });
+        } catch (claimErr) {
             failed++;
+            console.error(`❌ claimAll: claimMiner failed for miner ${miner.id}: ${claimErr.message}`);
+            details.push({ minerId: miner.id, rarityName: miner.rarity_name, error: claimErr.message });
         }
-        details.push({ minerId: miner.id, rarityName: miner.rarity_name, ...result });
     }
 
     // Refund fee for any miners that couldn't be claimed (e.g., claimed concurrently by another request)
@@ -676,9 +662,16 @@ async function repairMiner(wallet, minerId) {
     const { data: repairOk } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: cost });
     if (!repairOk) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
 
-    await supabase.from('miners').update({
+    const { error: minerUpdateErr } = await supabase.from('miners').update({
         nft_age_remaining: miner.nft_age_total, is_alive: true, needs_repair: false,
     }).eq('id', minerId);
+
+    if (minerUpdateErr) {
+        // Refund since the miner was not actually repaired
+        const { error: refundErr } = await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: cost });
+        if (refundErr) console.error(`❌ repair REFUND FAILED for ${w} miner ${minerId} (${cost} DC): ${refundErr.message}`);
+        throw new Error(`Failed to repair miner: ${minerUpdateErr.message}`);
+    }
 
     await supabase.from('repairs').insert({ wallet: w, miner_id: minerId, cost_digcoin: cost });
 
