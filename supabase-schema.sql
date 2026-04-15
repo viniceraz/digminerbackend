@@ -120,6 +120,27 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Atomic relative balance increment — prevents lost-update race conditions.
+-- All balance ADDITIONS go through this function; deductions keep the .gte() guard.
+CREATE OR REPLACE FUNCTION add_digcoin(
+    p_wallet              TEXT,
+    p_amount              DOUBLE PRECISION DEFAULT 0,
+    p_deposited_pathusd   DOUBLE PRECISION DEFAULT 0,
+    p_earned_digcoin      DOUBLE PRECISION DEFAULT 0,
+    p_referral_digcoin    DOUBLE PRECISION DEFAULT 0,
+    p_withdrawn_pathusd   DOUBLE PRECISION DEFAULT 0
+) RETURNS void AS $$
+BEGIN
+    UPDATE players SET
+        digcoin_balance         = digcoin_balance         + p_amount,
+        total_deposited_pathusd = total_deposited_pathusd + p_deposited_pathusd,
+        total_earned_digcoin    = total_earned_digcoin    + p_earned_digcoin,
+        referral_earnings       = referral_earnings       + p_referral_digcoin,
+        total_withdrawn_pathusd = total_withdrawn_pathusd + p_withdrawn_pathusd
+    WHERE wallet = p_wallet;
+END;
+$$ LANGUAGE plpgsql;
+
 -- ═══════════════════════════════════════════════════════
 -- ✅ Done! Your database is ready.
 -- ═══════════════════════════════════════════════════════

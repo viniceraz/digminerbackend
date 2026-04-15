@@ -245,21 +245,21 @@ async function processDeposit(wallet, amountPathUSD, txHash = '') {
         });
     }
 
-    await supabase.from('players').update({
-        digcoin_balance: player.digcoin_balance + digcoinAmount,
-        total_deposited_pathusd: player.total_deposited_pathusd + amountPathUSD,
-    }).eq('wallet', w);
+    // Atomic relative increment — safe against concurrent withdrawal/deposit races
+    await supabase.rpc('add_digcoin', {
+        p_wallet: w,
+        p_amount: digcoinAmount,
+        p_deposited_pathusd: amountPathUSD,
+    });
 
     // Referral: 4%
     if (player.referrer) {
         const bonus = digcoinAmount * (CONFIG.REFERRAL_PERCENT / 100);
-        const { data: ref } = await supabase.from('players').select('digcoin_balance, referral_earnings').eq('wallet', player.referrer).single();
-        if (ref) {
-            await supabase.from('players').update({
-                digcoin_balance: ref.digcoin_balance + bonus,
-                referral_earnings: ref.referral_earnings + bonus,
-            }).eq('wallet', player.referrer);
-        }
+        await supabase.rpc('add_digcoin', {
+            p_wallet: player.referrer,
+            p_amount: bonus,
+            p_referral_digcoin: bonus,
+        });
     }
 
     return { digcoinCredited: digcoinAmount, newBalance: player.digcoin_balance + digcoinAmount };
@@ -583,12 +583,12 @@ async function claimMiner(wallet, minerId) {
 
     if (!minerUpdated?.length) return { error: 'Reward already claimed (concurrent request)' };
 
-    // Credit player. Re-read fresh balance to avoid stale-read race on additions.
-    const { data: player } = await supabase.from('players').select('digcoin_balance, total_earned_digcoin').eq('wallet', w).single();
-    await supabase.from('players').update({
-        digcoin_balance: player.digcoin_balance + reward,
-        total_earned_digcoin: (player.total_earned_digcoin || 0) + reward,
-    }).eq('wallet', w);
+    // Atomic relative increment — no stale-read risk (RPC does UPDATE SET col=col+delta)
+    await supabase.rpc('add_digcoin', {
+        p_wallet: w,
+        p_amount: reward,
+        p_earned_digcoin: reward,
+    });
 
     await supabase.from('play_history').insert({ wallet: w, miner_id: minerId, reward_digcoin: reward });
 
@@ -680,11 +680,7 @@ async function claimAll(wallet) {
     const actualFee = CONFIG.PLAY_ALL_FEE_DIGCOIN * claimed;
     const refund = totalFee - actualFee;
     if (refund > 0) {
-        const { data: fp } = await supabase.from('players').select('digcoin_balance, total_spent_digcoin').eq('wallet', w).single();
-        await supabase.from('players').update({
-            digcoin_balance: fp.digcoin_balance + refund,
-            total_spent_digcoin: Math.max(0, (fp.total_spent_digcoin || 0) - refund),
-        }).eq('wallet', w);
+        await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: refund });
     }
 
     return {
@@ -1147,10 +1143,12 @@ app.post('/api/withdraw', financialLimit, checkMaintenance, requireAuth, async (
         try {
             sigData = await generateWithdrawSignature(w, amountPathUSD);
         } catch (sigErr) {
-            await supabase.from('players').update({
-                digcoin_balance: player.digcoin_balance,
-                total_withdrawn_pathusd: player.total_withdrawn_pathusd || 0,
-            }).eq('wallet', w);
+            // Undo the atomic deduction: add back balance and reverse the withdrawal stat
+            await supabase.rpc('add_digcoin', {
+                p_wallet: w,
+                p_amount: amount,
+                p_withdrawn_pathusd: -net,
+            });
             await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id);
             console.error(`❌ Withdraw signature failed for ${w}, balance restored:`, sigErr.message);
             return res.status(500).json({ error: 'Failed to generate withdrawal signature — balance restored, please try again' });
@@ -1220,9 +1218,7 @@ app.post('/api/admin/send-digcoin', requireAdmin, async (req, res) => {
         if (!/^0x[0-9a-f]{40}$/.test(w)) return res.status(400).json({ error: 'Invalid wallet address' });
 
         const player = await getOrCreatePlayer(w);
-        await supabase.from('players')
-            .update({ digcoin_balance: player.digcoin_balance + amt })
-            .eq('wallet', w);
+        await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: amt });
 
         // Log as a deposit with tx_hash starting with "admin_" so it never double-credits
         await supabase.from('deposits').insert({
