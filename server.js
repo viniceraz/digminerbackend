@@ -245,11 +245,12 @@ async function processDeposit(wallet, amountPathUSD, txHash = '') {
     // Referral: 4%
     if (player.referrer) {
         const bonus = digcoinAmount * (CONFIG.REFERRAL_PERCENT / 100);
-        await supabase.rpc('add_digcoin', {
+        const { error: refErr } = await supabase.rpc('add_digcoin', {
             p_wallet: player.referrer,
             p_amount: bonus,
             p_referral_digcoin: bonus,
         });
+        if (refErr) console.error(`❌ Referral bonus failed for ${player.referrer}: ${refErr.message}`);
     }
 
     return { digcoinCredited: digcoinAmount, newBalance: player.digcoin_balance + digcoinAmount };
@@ -296,7 +297,8 @@ async function buyBoxes(wallet, quantity = 1) {
         await supabase.rpc('add_digcoin', { p_wallet: w, p_boxes: quantity });
     } catch (insertErr) {
         // Rollback: refund balance (boxes_bought was never incremented)
-        await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: cost });
+        const { error: refundErr } = await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: cost });
+        if (refundErr) console.error(`❌ buyBoxes REFUND FAILED for ${w} (${cost} DC): ${refundErr.message}`);
         console.error(`❌ buyBoxes insert failed for ${w}, balance restored:`, insertErr.message);
         return { error: 'Failed to open box — balance restored, please try again' };
     }
@@ -468,7 +470,8 @@ async function fuseMiner(wallet, minerId1, minerId2) {
     }).select().single();
 
     if (insertErr || !newMiner) {
-        await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: cost });
+        const { error: refundErr } = await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: cost });
+        if (refundErr) console.error(`❌ fuse REFUND FAILED for ${w} (${cost} DC): ${refundErr.message}`);
         return { error: 'Failed to create fused miner — balance restored, please try again' };
     }
 
@@ -556,11 +559,17 @@ async function claimMiner(wallet, minerId) {
     if (!minerUpdated?.length) return { error: 'Reward already claimed (concurrent request)' };
 
     // Atomic relative increment — no stale-read risk (RPC does UPDATE SET col=col+delta)
-    await supabase.rpc('add_digcoin', {
+    const { error: rewardErr } = await supabase.rpc('add_digcoin', {
         p_wallet: w,
         p_amount: reward,
         p_earned_digcoin: reward,
     });
+    if (rewardErr) {
+        console.error(`❌ add_digcoin failed for claim ${w} miner ${minerId}: ${rewardErr.message} [code: ${rewardErr.code}]`);
+        // Restore miner to claimable state so the user can retry
+        await supabase.from('miners').update({ last_play_at: new Date().toISOString() }).eq('id', minerId);
+        throw new Error(`Failed to credit reward: ${rewardErr.message}`);
+    }
 
     await supabase.from('play_history').insert({ wallet: w, miner_id: minerId, reward_digcoin: reward });
 
@@ -636,7 +645,8 @@ async function claimAll(wallet) {
     const actualFee = CONFIG.PLAY_ALL_FEE_DIGCOIN * claimed;
     const refund = totalFee - actualFee;
     if (refund > 0) {
-        await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: refund });
+        const { error: refundErr } = await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: refund });
+        if (refundErr) console.error(`❌ claimAll REFUND FAILED for ${w} (${refund} DC): ${refundErr.message}`);
     }
 
     return {
@@ -1086,11 +1096,12 @@ app.post('/api/withdraw', financialLimit, checkMaintenance, requireAuth, async (
             sigData = await generateWithdrawSignature(w, amountPathUSD);
         } catch (sigErr) {
             // Undo the atomic deduction: add back balance and reverse the withdrawal stat
-            await supabase.rpc('add_digcoin', {
+            const { error: refundErr } = await supabase.rpc('add_digcoin', {
                 p_wallet: w,
                 p_amount: amount,
                 p_withdrawn_pathusd: -net,
             });
+            if (refundErr) console.error(`❌ withdraw REFUND FAILED for ${w} (${amount} DC): ${refundErr.message}`);
             await supabase.from('withdrawals').update({ status: 'cancelled' }).eq('id', pending.id);
             console.error(`❌ Withdraw signature failed for ${w}, balance restored:`, sigErr.message);
             return res.status(500).json({ error: 'Failed to generate withdrawal signature — balance restored, please try again' });
