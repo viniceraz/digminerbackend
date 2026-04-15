@@ -116,9 +116,9 @@ BEGIN
         COALESCE(SUM(total_deposited_pathusd), 0),
         COALESCE(SUM(total_withdrawn_pathusd), 0),
         COALESCE(SUM(boxes_bought)::INTEGER, 0)
-    FROM players;
+    FROM public.players;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = '';
 
 -- Atomic relative balance increment — prevents lost-update race conditions.
 -- All balance ADDITIONS go through this function; deductions use spend_digcoin.
@@ -132,7 +132,7 @@ CREATE OR REPLACE FUNCTION add_digcoin(
     p_boxes               INTEGER DEFAULT 0
 ) RETURNS void AS $$
 BEGIN
-    UPDATE players SET
+    UPDATE public.players SET
         digcoin_balance         = digcoin_balance         + p_amount,
         total_deposited_pathusd = total_deposited_pathusd + p_deposited_pathusd,
         total_earned_digcoin    = total_earned_digcoin    + p_earned_digcoin,
@@ -141,7 +141,7 @@ BEGIN
         boxes_bought            = boxes_bought            + p_boxes
     WHERE wallet = p_wallet;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = '';
 
 -- Atomic relative balance deduction — prevents concurrent double-spend.
 -- Returns TRUE if deduction succeeded (balance >= p_amount), FALSE otherwise.
@@ -157,7 +157,7 @@ CREATE OR REPLACE FUNCTION spend_digcoin(
 DECLARE
     rows_updated INTEGER;
 BEGIN
-    UPDATE players SET
+    UPDATE public.players SET
         digcoin_balance         = digcoin_balance - p_amount,
         total_spent_digcoin     = CASE WHEN p_withdrawn_pathusd = 0
                                        THEN total_spent_digcoin + p_amount
@@ -167,7 +167,47 @@ BEGIN
     GET DIAGNOSTICS rows_updated = ROW_COUNT;
     RETURN rows_updated > 0;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = '';
+
+-- Atomic deposit processing: inserts deposit record AND credits player balance
+-- in a single transaction. Returns: 'credited', 'duplicate', or raises an exception.
+-- This prevents the race condition where INSERT succeeds but the balance RPC fails.
+CREATE OR REPLACE FUNCTION process_deposit(
+    p_wallet          TEXT,
+    p_amount_pathusd  DOUBLE PRECISION,
+    p_digcoin_amount  DOUBLE PRECISION,
+    p_tx_hash         TEXT DEFAULT NULL
+) RETURNS TEXT AS $$
+DECLARE
+    v_inserted INTEGER;
+BEGIN
+    -- Try to insert deposit record (UNIQUE constraint on tx_hash guards against duplicates)
+    IF p_tx_hash IS NOT NULL THEN
+        INSERT INTO public.deposits (wallet, amount_pathusd, digcoin_credited, tx_hash)
+        VALUES (p_wallet, p_amount_pathusd, p_digcoin_amount, p_tx_hash)
+        ON CONFLICT (tx_hash) DO NOTHING;
+        GET DIAGNOSTICS v_inserted = ROW_COUNT;
+        IF v_inserted = 0 THEN
+            RETURN 'duplicate';
+        END IF;
+    ELSE
+        INSERT INTO public.deposits (wallet, amount_pathusd, digcoin_credited, tx_hash)
+        VALUES (p_wallet, p_amount_pathusd, p_digcoin_amount, p_tx_hash);
+    END IF;
+
+    -- Credit balance atomically in the same transaction
+    UPDATE public.players SET
+        digcoin_balance         = digcoin_balance         + p_digcoin_amount,
+        total_deposited_pathusd = total_deposited_pathusd + p_amount_pathusd
+    WHERE wallet = p_wallet;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Player not found: %', p_wallet;
+    END IF;
+
+    RETURN 'credited';
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = '';
 
 -- ═══════════════════════════════════════════════════════
 -- ✅ Done! Your database is ready.

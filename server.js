@@ -194,11 +194,21 @@ async function getOrCreatePlayer(wallet, referrer = null) {
             if (!refExists) ref = null;
         } else { ref = null; }
 
-        const { data: newPlayer } = await supabase.from('players')
+        const { data: newPlayer, error: insertErr } = await supabase.from('players')
             .insert({ wallet: w, referrer: ref })
             .select().single();
-        player = newPlayer;
+        if (insertErr && insertErr.code !== '23505') {
+            throw new Error(`Failed to create player: ${insertErr.message}`);
+        }
+        // If 23505 (unique violation), another concurrent request created the player — re-fetch
+        if (!newPlayer) {
+            const { data: retried } = await supabase.from('players').select('*').eq('wallet', w).single();
+            player = retried;
+        } else {
+            player = newPlayer;
+        }
     }
+    if (!player) throw new Error(`Player not found and could not be created: ${w}`);
     return player;
 }
 
@@ -208,52 +218,29 @@ async function getOrCreatePlayer(wallet, referrer = null) {
 
 async function processDeposit(wallet, amountPathUSD, txHash = '') {
     const w = norm(wallet);
-
-    // Fast-path duplicate check (SELECT before INSERT saves a round-trip in the common case)
-    if (txHash) {
-        const { data: existing } = await supabase.from('deposits').select('id').eq('tx_hash', txHash).limit(1);
-        if (existing?.length) {
-            console.log(`⚠️  Duplicate deposit ignored: ${txHash}`);
-            return { duplicate: true };
-        }
-    }
-
-    const player = await getOrCreatePlayer(w);
     const digcoinAmount = amountPathUSD * CONFIG.DIGCOIN_PER_PATHUSD;
 
-    // INSERT the deposit record BEFORE updating the balance.
-    // The UNIQUE index on tx_hash is the real guard against concurrent duplicates:
-    // if two requests race past the SELECT check above, only one INSERT will succeed.
-    // The balance update is only reached after a successful INSERT, so DIGCOIN is
-    // never credited twice for the same on-chain transaction.
-    if (txHash) {
-        const { error: insertErr } = await supabase.from('deposits').insert({
-            wallet: w, amount_pathusd: amountPathUSD, digcoin_credited: digcoinAmount, tx_hash: txHash,
-        });
-        if (insertErr) {
-            // code 23505 = unique_violation — another request already inserted this txHash
-            if (insertErr.code === '23505') {
-                console.log(`⚠️  Duplicate deposit blocked by constraint: ${txHash}`);
-                return { duplicate: true };
-            }
-            throw new Error(insertErr.message);
-        }
-    } else {
-        // No txHash (e.g. admin credit) — insert without unique guard
-        await supabase.from('deposits').insert({
-            wallet: w, amount_pathusd: amountPathUSD, digcoin_credited: digcoinAmount, tx_hash: txHash,
-        });
+    // Ensure player exists before the atomic deposit (process_deposit does UPDATE, not UPSERT)
+    const player = await getOrCreatePlayer(w);
+
+    // Single atomic Postgres call: inserts deposit record AND credits balance in one transaction.
+    // The UNIQUE index on tx_hash guards against concurrent duplicate submissions.
+    const { data: result, error: depositErr } = await supabase.rpc('process_deposit', {
+        p_wallet: w,
+        p_amount_pathusd: amountPathUSD,
+        p_digcoin_amount: digcoinAmount,
+        p_tx_hash: txHash || null,
+    });
+    if (depositErr) {
+        console.error(`❌ process_deposit failed for ${w} (${digcoinAmount} DC): ${depositErr.message} [code: ${depositErr.code}]`);
+        throw new Error(`Failed to process deposit: ${depositErr.message}`);
+    }
+    if (result === 'duplicate') {
+        console.log(`⚠️  Duplicate deposit ignored: ${txHash}`);
+        return { duplicate: true };
     }
 
-    // Atomic relative increment — safe against concurrent withdrawal/deposit races
-    const { error: creditErr } = await supabase.rpc('add_digcoin', {
-        p_wallet: w,
-        p_amount: digcoinAmount,
-        p_deposited_pathusd: amountPathUSD,
-    });
-    if (creditErr) {
-        console.error(`❌ add_digcoin failed for ${w} (${digcoinAmount} DC): ${creditErr.message} [code: ${creditErr.code}]`);
-    }
+    console.log(`✅ Deposit credited: ${digcoinAmount} DIGCOIN to ${w} (tx: ${txHash})`);
 
     // Referral: 4%
     if (player.referrer) {
