@@ -1381,6 +1381,51 @@ app.post('/api/admin/maintenance', requireAdmin, (req, res) => {
 });
 
 // Send DIGCOIN to any wallet (for giveaways, influencers, payments)
+// Gift miner boxes to a list of wallets (no cost, admin only)
+app.post('/api/admin/gift-boxes', requireAdmin, async (req, res) => {
+    try {
+        const { wallets } = req.body;
+        if (!Array.isArray(wallets) || wallets.length === 0) return res.status(400).json({ error: 'wallets array required' });
+        if (wallets.length > 50) return res.status(400).json({ error: 'Max 50 wallets per batch' });
+
+        const results = [];
+        for (const raw of wallets) {
+            const w = norm(raw);
+            if (!/^0x[0-9a-f]{40}$/.test(w)) {
+                results.push({ wallet: raw, success: false, error: 'Invalid address' });
+                continue;
+            }
+            try {
+                await getOrCreatePlayer(w);
+                const rarity = rollRarity();
+                const dailyDigcoin = randBetween(rarity.dailyMin, rarity.dailyMax);
+                const stats = generateStats(rarity);
+
+                const { data: miner, error: minerErr } = await supabase.from('miners').insert({
+                    wallet: w, rarity_id: rarity.id, rarity_name: rarity.name,
+                    daily_digcoin: dailyDigcoin, nft_age_total: rarity.nftAge, nft_age_remaining: rarity.nftAge,
+                    ...stats,
+                }).select().single();
+
+                if (minerErr || !miner) throw new Error(minerErr?.message || 'Failed to create miner');
+
+                // Log as a free box purchase (cost = 0, distinguishable from paid)
+                await supabase.from('box_purchases').insert({ wallet: w, miner_id: miner.id, cost_digcoin: 0, box_type: 'gift' });
+                await supabase.rpc('add_digcoin', { p_wallet: w, p_boxes: 1 });
+
+                console.log(`🎁 [ADMIN] Gift box → ${w}: ${rarity.name} miner #${miner.id} (${dailyDigcoin} DC/day)`);
+                results.push({ wallet: w, success: true, minerId: miner.id, rarityName: rarity.name, dailyDigcoin });
+            } catch (e) {
+                results.push({ wallet: raw, success: false, error: e.message });
+            }
+        }
+
+        const sent = results.filter(r => r.success).length;
+        const failed = results.filter(r => !r.success).length;
+        res.json({ sent, failed, results });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post('/api/admin/send-digcoin', requireAdmin, async (req, res) => {
     try {
         const { toWallet, amount, reason } = req.body;
