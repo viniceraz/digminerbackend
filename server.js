@@ -93,6 +93,8 @@ const CONFIG = {
     REFERRAL_PERCENT: 4,
     PLAY_COOLDOWN_MS: 24 * 60 * 60 * 1000,
     PLAY_ALL_FEE_DIGCOIN: 5,      // fee per miner when using Play All / Claim All
+    AUTO_PICKAXE_PRICE: 3000,     // one-time lifetime purchase
+    AUTO_PICKAXE_MAX_SUPPLY: 500, // hard cap
     SIGNATURE_DEADLINE_SECS: 3600,
 
     RARITIES: [
@@ -753,47 +755,53 @@ async function claimMiner(wallet, minerId) {
 // Play All: start all idle miners (last_play_at IS NULL)
 async function playAll(wallet) {
     const w = norm(wallet);
-    const { data: miners } = await supabase.from('miners')
-        .select('*').eq('wallet', w).eq('is_alive', true).eq('needs_repair', false).is('last_play_at', null);
+    const [{ data: miners }, { data: perk }] = await Promise.all([
+        supabase.from('miners').select('*').eq('wallet', w).eq('is_alive', true).eq('needs_repair', false).is('last_play_at', null),
+        supabase.from('player_perks').select('active').eq('wallet', w).eq('perk_type', 'auto_pickaxe').maybeSingle(),
+    ]);
 
     if (!miners?.length) return { error: 'No idle miners to start. All are mining or need repair.' };
 
-    const totalFee = CONFIG.PLAY_ALL_FEE_DIGCOIN * miners.length;
-    const { data: player } = await supabase.from('players').select('digcoin_balance, total_spent_digcoin').eq('wallet', w).single();
+    const feeWaived = perk?.active === true;
+    const totalFee = feeWaived ? 0 : CONFIG.PLAY_ALL_FEE_DIGCOIN * miners.length;
 
-    if (player.digcoin_balance < totalFee) {
-        return { error: `Insufficient balance. Need ${totalFee} DIGCOIN (${CONFIG.PLAY_ALL_FEE_DIGCOIN} per miner × ${miners.length} miners)` };
+    if (!feeWaived) {
+        const { data: player } = await supabase.from('players').select('digcoin_balance').eq('wallet', w).single();
+        if (player.digcoin_balance < totalFee) {
+            return { error: `Insufficient balance. Need ${totalFee} DIGCOIN (${CONFIG.PLAY_ALL_FEE_DIGCOIN} per miner × ${miners.length} miners)` };
+        }
+        const { data: ok } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: totalFee });
+        if (!ok) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
     }
-
-    // Atomic relative deduction — safe against concurrent double-spend
-    const { data: ok } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: totalFee });
-    if (!ok) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
 
     const now = new Date().toISOString();
     const ids = miners.map(m => m.id);
     const { error: startErr } = await supabase.from('miners').update({ last_play_at: now }).in('id', ids);
 
     if (startErr) {
-        // Refund fee since miners were not started
-        const { error: refundErr } = await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: totalFee });
-        if (refundErr) console.error(`❌ playAll REFUND FAILED for ${w} (${totalFee} DC): ${refundErr.message}`);
+        if (!feeWaived) {
+            const { error: refundErr } = await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: totalFee });
+            if (refundErr) console.error(`❌ playAll REFUND FAILED for ${w} (${totalFee} DC): ${refundErr.message}`);
+        }
         throw new Error(`Failed to start miners: ${startErr.message}`);
     }
 
     await supabase.from('activity_log').insert({
         wallet: w, type: 'play_all',
-        detail: `Play All — started ${miners.length} miner${miners.length !== 1 ? 's' : ''}`,
+        detail: `Play All — started ${miners.length} miner${miners.length !== 1 ? 's' : ''}${feeWaived ? ' (Auto Pickaxe — fee waived)' : ''}`,
         amount_digcoin: totalFee,
     });
 
-    return { success: true, started: miners.length, fee: totalFee };
+    return { success: true, started: miners.length, fee: totalFee, feeWaived };
 }
 
 // Claim All: collect from all ready miners (24h passed)
 async function claimAll(wallet) {
     const w = norm(wallet);
-    const { data: miners } = await supabase.from('miners')
-        .select('*').eq('wallet', w).eq('is_alive', true).eq('needs_repair', false).not('last_play_at', 'is', null);
+    const [{ data: miners }, { data: perk }] = await Promise.all([
+        supabase.from('miners').select('*').eq('wallet', w).eq('is_alive', true).eq('needs_repair', false).not('last_play_at', 'is', null),
+        supabase.from('player_perks').select('active').eq('wallet', w).eq('perk_type', 'auto_pickaxe').maybeSingle(),
+    ]);
 
     if (!miners?.length) return { error: 'No miners are mining' };
 
@@ -802,16 +810,17 @@ async function claimAll(wallet) {
 
     if (!ready.length) return { error: 'No miners ready to claim yet. Come back in 24h!' };
 
-    const totalFee = CONFIG.PLAY_ALL_FEE_DIGCOIN * ready.length;
-    const { data: player } = await supabase.from('players').select('digcoin_balance, total_spent_digcoin').eq('wallet', w).single();
+    const feeWaived = perk?.active === true;
+    const totalFee = feeWaived ? 0 : CONFIG.PLAY_ALL_FEE_DIGCOIN * ready.length;
 
-    if (player.digcoin_balance < totalFee) {
-        return { error: `Insufficient balance for Claim All fee. Need ${totalFee} DIGCOIN (${CONFIG.PLAY_ALL_FEE_DIGCOIN} × ${ready.length} miners)` };
+    if (!feeWaived) {
+        const { data: player } = await supabase.from('players').select('digcoin_balance').eq('wallet', w).single();
+        if (player.digcoin_balance < totalFee) {
+            return { error: `Insufficient balance for Claim All fee. Need ${totalFee} DIGCOIN (${CONFIG.PLAY_ALL_FEE_DIGCOIN} × ${ready.length} miners)` };
+        }
+        const { data: feeOk } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: totalFee });
+        if (!feeOk) return { error: 'Insufficient balance for Claim All fee (concurrent update conflict — try again)' };
     }
-
-    // Atomic relative deduction — safe against concurrent double-spend
-    const { data: feeOk } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: totalFee });
-    if (!feeOk) return { error: 'Insufficient balance for Claim All fee (concurrent update conflict — try again)' };
 
     let totalReward = 0, claimed = 0, died = 0, failed = 0;
     const details = [];
@@ -834,18 +843,20 @@ async function claimAll(wallet) {
         }
     }
 
-    // Refund fee for any miners that couldn't be claimed (e.g., claimed concurrently by another request)
-    const actualFee = CONFIG.PLAY_ALL_FEE_DIGCOIN * claimed;
-    const refund = totalFee - actualFee;
-    if (refund > 0) {
-        const { error: refundErr } = await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: refund });
-        if (refundErr) console.error(`❌ claimAll REFUND FAILED for ${w} (${refund} DC): ${refundErr.message}`);
+    // Refund partial fee for miners that failed (only if fee was charged)
+    const actualFee = feeWaived ? 0 : CONFIG.PLAY_ALL_FEE_DIGCOIN * claimed;
+    if (!feeWaived) {
+        const refund = totalFee - actualFee;
+        if (refund > 0) {
+            const { error: refundErr } = await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: refund });
+            if (refundErr) console.error(`❌ claimAll REFUND FAILED for ${w} (${refund} DC): ${refundErr.message}`);
+        }
     }
 
     if (claimed > 0) {
         await supabase.from('activity_log').insert({
             wallet: w, type: 'claim_all',
-            detail: `Claim All — ${claimed} miner${claimed !== 1 ? 's' : ''} claimed, fee ${actualFee} DC, reward ${Math.round(totalReward * 100) / 100} DC`,
+            detail: `Claim All — ${claimed} miner${claimed !== 1 ? 's' : ''} claimed, fee ${actualFee} DC, reward ${Math.round(totalReward * 100) / 100} DC${feeWaived ? ' (Auto Pickaxe — fee waived)' : ''}`,
             amount_digcoin: actualFee,
         });
     }
@@ -854,7 +865,7 @@ async function claimAll(wallet) {
         totalReward: Math.round(totalReward * 100) / 100,
         claimAllFee: actualFee,
         netReward: Math.round((totalReward - actualFee) * 100) / 100,
-        claimed, died, failed, details,
+        claimed, died, failed, details, feeWaived,
     };
 }
 
@@ -1019,7 +1030,10 @@ app.get('/api/player/:wallet', async (req, res) => {
         const w = norm(raw);
         const { data: player } = await supabase.from('players').select('*').eq('wallet', w).single();
         if (!player) return res.status(404).json({ error: 'Player not found' });
-        const { data: miners } = await supabase.from('miners').select('*').eq('wallet', w).order('created_at', { ascending: false });
+        const [{ data: miners }, { data: perkData }] = await Promise.all([
+            supabase.from('miners').select('*').eq('wallet', w).order('created_at', { ascending: false }),
+            supabase.from('player_perks').select('active').eq('wallet', w).eq('perk_type', 'auto_pickaxe').maybeSingle(),
+        ]);
 
         const now = Date.now();
         const mapped = (miners || []).map(m => {
@@ -1066,6 +1080,7 @@ app.get('/api/player/:wallet', async (req, res) => {
             },
             miners: mapped,
             stats: { totalMiners: mapped.length, aliveMiners: alive.length, dailyIncome: alive.reduce((s, m) => s + m.dailyDigcoin, 0) },
+            autoPickaxe: perkData ? { owned: true, active: perkData.active } : { owned: false, active: false },
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1229,6 +1244,56 @@ app.post('/api/repair/:minerId', financialLimit, checkMaintenance, requireAuth, 
         const result = await repairMiner(wallet, minerId);
         if (result.error) return res.status(400).json(result);
         res.json(result);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Buy Auto Pickaxe (lifetime perk)
+app.post('/api/buy-auto-pickaxe', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
+    try {
+        const { wallet } = req.body;
+        if (!wallet || !isValidAddress(wallet)) return res.status(400).json({ error: 'wallet required' });
+        const w = norm(wallet);
+
+        const [{ count: supply }, { data: existing }] = await Promise.all([
+            supabase.from('player_perks').select('*', { count: 'exact', head: true }).eq('perk_type', 'auto_pickaxe'),
+            supabase.from('player_perks').select('id').eq('wallet', w).eq('perk_type', 'auto_pickaxe').maybeSingle(),
+        ]);
+
+        if ((supply || 0) >= CONFIG.AUTO_PICKAXE_MAX_SUPPLY) return res.status(400).json({ error: `Auto Pickaxe sold out! (${CONFIG.AUTO_PICKAXE_MAX_SUPPLY}/${CONFIG.AUTO_PICKAXE_MAX_SUPPLY})` });
+        if (existing) return res.status(400).json({ error: 'You already own an Auto Pickaxe!' });
+
+        const { data: ok } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: CONFIG.AUTO_PICKAXE_PRICE });
+        if (!ok) return res.status(400).json({ error: `Insufficient balance. Auto Pickaxe costs ${CONFIG.AUTO_PICKAXE_PRICE} DIGCOIN` });
+
+        const { error: insertErr } = await supabase.from('player_perks').insert({ wallet: w, perk_type: 'auto_pickaxe', active: true });
+        if (insertErr) {
+            await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: CONFIG.AUTO_PICKAXE_PRICE });
+            throw new Error(`Failed to grant perk: ${insertErr.message}`);
+        }
+
+        await supabase.from('activity_log').insert({
+            wallet: w, type: 'auto_pickaxe_purchase',
+            detail: `Purchased Auto Pickaxe (lifetime)`,
+            amount_digcoin: CONFIG.AUTO_PICKAXE_PRICE,
+        });
+
+        res.json({ success: true, autoPickaxe: { owned: true, active: true } });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Toggle Auto Pickaxe on/off
+app.post('/api/toggle-auto-pickaxe', requireAuth, async (req, res) => {
+    try {
+        const { wallet, active } = req.body;
+        if (!wallet || !isValidAddress(wallet)) return res.status(400).json({ error: 'wallet required' });
+        if (typeof active !== 'boolean') return res.status(400).json({ error: 'active (boolean) required' });
+        const w = norm(wallet);
+
+        const { data: existing } = await supabase.from('player_perks').select('id').eq('wallet', w).eq('perk_type', 'auto_pickaxe').maybeSingle();
+        if (!existing) return res.status(400).json({ error: 'You do not own an Auto Pickaxe' });
+
+        await supabase.from('player_perks').update({ active }).eq('wallet', w).eq('perk_type', 'auto_pickaxe');
+        res.json({ success: true, autoPickaxe: { owned: true, active } });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1515,12 +1580,15 @@ app.get('/api/stats', async (req, res) => {
         const { count: totalMiners } = await supabase.from('miners').select('*', { count: 'exact', head: true });
         const { count: aliveMiners } = await supabase.from('miners').select('*', { count: 'exact', head: true }).eq('is_alive', true);
         const { count: landsMinted } = await supabase.from('lands').select('*', { count: 'exact', head: true });
+        const { count: autoPickaxesMinted } = await supabase.from('player_perks').select('*', { count: 'exact', head: true }).eq('perk_type', 'auto_pickaxe');
         const { data: agg } = await supabase.rpc('get_global_stats');
         res.json({
             totalPlayers, totalMiners, aliveMiners, ...(agg?.[0] || {}),
             landSaleStartMs: LAND_SALE_START_MS,
             landsMinted: landsMinted || 0,
             landMaxSupply: CONFIG.LAND_BOX_MAX_SUPPLY,
+            autoPickaxesMinted: autoPickaxesMinted || 0,
+            autoPickaxeMaxSupply: CONFIG.AUTO_PICKAXE_MAX_SUPPLY,
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1554,6 +1622,43 @@ app.get('/api/config', (req, res) => {
         })),
     });
 });
+
+// ════════════════════════════════════════════
+// AUTO PICKAXE WORKER
+// Runs every hour — claims ready miners and restarts idle ones
+// for all wallets with active Auto Pickaxe perk. Fees are already
+// waived inside claimAll/playAll when perk.active === true.
+// ════════════════════════════════════════════
+
+async function runAutoPickaxeWorker() {
+    if (MAINTENANCE_MODE) return;
+    try {
+        const { data: perks } = await supabase.from('player_perks')
+            .select('wallet').eq('perk_type', 'auto_pickaxe').eq('active', true);
+        if (!perks?.length) return;
+        console.log(`🪓 [Auto Pickaxe] Processing ${perks.length} active wallet(s)...`);
+        for (const { wallet: w } of perks) {
+            try {
+                const claimResult = await claimAll(w);
+                if (claimResult.claimed > 0) {
+                    console.log(`🪓 [Auto Pickaxe] ${w}: claimed ${claimResult.claimed} miners (+${claimResult.totalReward} DC)`);
+                }
+                const playResult = await playAll(w);
+                if (playResult.started > 0) {
+                    console.log(`🪓 [Auto Pickaxe] ${w}: started ${playResult.started} miners`);
+                }
+            } catch (err) {
+                console.error(`❌ [Auto Pickaxe] Worker error for ${w}: ${err.message}`);
+            }
+        }
+    } catch (err) {
+        console.error(`❌ [Auto Pickaxe] Worker fatal: ${err.message}`);
+    }
+}
+
+// Run once at startup (catch up any missed cycles), then every hour
+setTimeout(runAutoPickaxeWorker, 30_000);
+setInterval(runAutoPickaxeWorker, 60 * 60 * 1000);
 
 // ════════════════════════════════════════════
 // START
