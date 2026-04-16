@@ -92,7 +92,7 @@ const CONFIG = {
     WITHDRAW_FEE_PERCENT: 6,
     REFERRAL_PERCENT: 4,
     PLAY_COOLDOWN_MS: 24 * 60 * 60 * 1000,
-    PLAY_ALL_FEE_DIGCOIN: 10,     // fee per miner when using Play All / Claim All
+    PLAY_ALL_FEE_DIGCOIN: 5,      // fee per miner when using Play All / Claim All
     SIGNATURE_DEADLINE_SECS: 3600,
 
     RARITIES: [
