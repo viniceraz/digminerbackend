@@ -1535,6 +1535,26 @@ app.get('/api/admin/withdrawals-by-day', requireAdmin, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Deposits by day
+app.get('/api/admin/deposits-by-day', requireAdmin, async (req, res) => {
+    try {
+        const date = req.query.date;
+        if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'date param required (YYYY-MM-DD)' });
+        const from = `${date}T00:00:00.000Z`;
+        const to   = `${date}T23:59:59.999Z`;
+        const { data: rows } = await supabase.from('deposits')
+            .select('wallet, amount_pathusd, digcoin_credited, tx_hash, created_at')
+            .gte('created_at', from).lte('created_at', to)
+            .order('created_at', { ascending: false });
+        const list = rows || [];
+        const realDeposits = list.filter(r => !r.tx_hash?.startsWith('admin_'));
+        const adminCredits = list.filter(r => r.tx_hash?.startsWith('admin_'));
+        const totalPathUSD = realDeposits.reduce((s, r) => s + (r.amount_pathusd || 0), 0);
+        const totalDigcoin = list.reduce((s, r) => s + (r.digcoin_credited || 0), 0);
+        res.json({ date, deposits: list, totalPathUSD, totalDigcoin, count: list.length, realCount: realDeposits.length, adminCount: adminCredits.length });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/admin/players', requireAdmin, async (req, res) => {
     try {
         const { data: players } = await supabase.from('players')
