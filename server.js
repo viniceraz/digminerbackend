@@ -1525,7 +1525,7 @@ app.get('/api/admin/withdrawals-by-day', requireAdmin, async (req, res) => {
         const { data: rows } = await supabase.from('withdrawals')
             .select('wallet, amount_digcoin, amount_pathusd, fee_pathusd, net_pathusd, status, created_at')
             .gte('created_at', from).lte('created_at', to)
-            .in('status', ['completed', 'pending'])
+            .in('status', ['completed', 'pending', 'ready'])
             .order('created_at', { ascending: false });
         const list = rows || [];
         const totalDigcoin = list.reduce((s, r) => s + (r.amount_digcoin || 0), 0);
