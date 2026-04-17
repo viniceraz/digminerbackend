@@ -1515,6 +1515,26 @@ app.post('/api/admin/send-digcoin', requireAdmin, async (req, res) => {
 });
 
 // List players (admin view — wallet + balance + miner count)
+// Withdrawals by day — returns all completed withdrawals for a given date (UTC)
+app.get('/api/admin/withdrawals-by-day', requireAdmin, async (req, res) => {
+    try {
+        const date = req.query.date; // YYYY-MM-DD
+        if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'date param required (YYYY-MM-DD)' });
+        const from = `${date}T00:00:00.000Z`;
+        const to   = `${date}T23:59:59.999Z`;
+        const { data: rows } = await supabase.from('withdrawals')
+            .select('wallet, amount_digcoin, amount_pathusd, fee_pathusd, net_pathusd, status, created_at')
+            .gte('created_at', from).lte('created_at', to)
+            .in('status', ['completed', 'pending'])
+            .order('created_at', { ascending: false });
+        const list = rows || [];
+        const totalDigcoin = list.reduce((s, r) => s + (r.amount_digcoin || 0), 0);
+        const totalPathUSD = list.reduce((s, r) => s + (r.amount_pathusd || 0), 0);
+        const totalFees    = list.reduce((s, r) => s + (r.fee_pathusd || 0), 0);
+        res.json({ date, withdrawals: list, totalDigcoin, totalPathUSD, totalFees, count: list.length });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/admin/players', requireAdmin, async (req, res) => {
     try {
         const { data: players } = await supabase.from('players')
