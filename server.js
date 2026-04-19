@@ -1309,6 +1309,24 @@ app.post('/api/withdraw', financialLimit, checkMaintenance, requireAuth, async (
         if (isNaN(amount) || amount < MIN_WITHDRAW) return res.status(400).json({ error: `Minimum withdrawal is ${MIN_WITHDRAW} DIGCOIN (1 pathUSD)` });
         if (amount > player.digcoin_balance) return res.status(400).json({ error: `Insufficient balance. Have ${player.digcoin_balance.toFixed(2)} DIGCOIN` });
 
+        // Check player has enough pathUSD on-chain to cover gas fees (pathUSD is gas token on Tempo)
+        const MIN_GAS_RESERVE = ethers.parseUnits('0.5', CONFIG.PATHUSD_DECIMALS);
+        try {
+            const _provider = new ethers.JsonRpcProvider(CONFIG.RPC_URL);
+            const pathUSDToken = new ethers.Contract(
+                '0x20C0000000000000000000000000000000000000',
+                ['function balanceOf(address) view returns (uint256)'],
+                _provider
+            );
+            const onChainBalance = await pathUSDToken.balanceOf(w);
+            if (onChainBalance < MIN_GAS_RESERVE) {
+                const bal = ethers.formatUnits(onChainBalance, CONFIG.PATHUSD_DECIMALS);
+                return res.status(400).json({ error: `Insufficient pathUSD for gas fees. You need at least 0.5 pathUSD in your wallet to cover the transaction fee. Current balance: ${bal} pathUSD` });
+            }
+        } catch (gasCheckErr) {
+            console.warn('⚠️ Gas check failed (non-blocking):', gasCheckErr.message);
+        }
+
         const COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
         // Initial cooldown check (fast-path rejection for obvious cases)
