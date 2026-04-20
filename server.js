@@ -1636,6 +1636,7 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
             boxDropped,
             hpLost,
             newHp,
+            maxHp: CONFIG.RARITIES[miner.rarity_id]?.maxHp ?? 100,
             needsRepair,
             finalWinChance: Math.round(finalWinChance * 100),
         });
