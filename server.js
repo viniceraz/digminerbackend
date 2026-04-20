@@ -909,7 +909,7 @@ async function repairMiner(wallet, minerId) {
     if (!repairOk) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
 
     const { error: minerUpdateErr } = await supabase.from('miners').update({
-        nft_age_remaining: miner.nft_age_total, is_alive: true, needs_repair: false,
+        nft_age_remaining: rarity.nftAge, nft_age_total: rarity.nftAge, is_alive: true, needs_repair: false,
         hp: rarity.maxHp,
     }).eq('id', minerId);
 
