@@ -1537,6 +1537,13 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
             }
         }
 
+        // Check dungeon pool has enough to cover the prize
+        const { data: poolRow } = await supabase.from('dungeon_pool').select('balance_digcoin').eq('id', 1).single();
+        const poolBalance = parseFloat(poolRow?.balance_digcoin || 0);
+        if (poolBalance < dungeon.prize) {
+            return res.status(400).json({ error: `Dungeon temporarily closed — prize pool is refilling. Check back soon!` });
+        }
+
         // Consume map
         const { error: mapErr } = await supabase.rpc('spend_inventory_item', { p_wallet: w, p_item_type: dungeon.mapItem, p_quantity: 1 });
         if (mapErr) return res.status(400).json({ error: 'Failed to consume map. Try again.' });
