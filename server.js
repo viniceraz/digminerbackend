@@ -94,7 +94,7 @@ const CONFIG = {
     PLAY_COOLDOWN_MS: 24 * 60 * 60 * 1000,
     PLAY_ALL_FEE_DIGCOIN: 5,      // fee per miner when using Play All / Claim All
 
-    DUNGEON_COOLDOWN_MS: 60 * 60 * 1000, // 1 hour between dungeon runs
+    DUNGEON_COOLDOWN_MS: 60 * 1000, // 1 minute between dungeon runs
     DUNGEONS: {
         easy:   { name: 'Goblins',  mapItem: 'map_easy',   mapCost: 50,  prize: 80,  winChance: 0.45, hpLoss: 25, boxDropChance: 0.02 },
         medium: { name: 'Spiders',  mapItem: 'map_medium', mapCost: 150, prize: 280, winChance: 0.40, hpLoss: 40, boxDropChance: 0.05 },
@@ -1076,6 +1076,7 @@ app.get('/api/player/:wallet', async (req, res) => {
                 level: m.level, exp: m.exp, power: m.power, energy: m.energy, protective: m.protective, damage: m.damage,
                 hp: m.hp ?? 100, maxHp: m.max_hp ?? 100,
                 lastDungeonAt: m.last_dungeon_at,
+                lastDungeonType: m.last_dungeon_type || null,
                 dungeonCooldownRemaining: m.last_dungeon_at ? Math.max(0, CONFIG.DUNGEON_COOLDOWN_MS - (Date.now() - new Date(m.last_dungeon_at).getTime())) : 0,
                 repairCostDigcoin: rarity.repairPathUSD * CONFIG.DIGCOIN_PER_PATHUSD,
                 repairCostPathUSD: rarity.repairPathUSD, color: rarity.color,
@@ -1590,6 +1591,7 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
             needs_repair: needsRepair,
             is_alive: needsRepair ? false : miner.is_alive,
             last_dungeon_at: new Date().toISOString(),
+            last_dungeon_type: dungeonType,
         }).eq('id', mid);
 
         // Log run
