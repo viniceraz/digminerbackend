@@ -1652,7 +1652,7 @@ app.get('/api/dungeon/inventory', requireAuth, async (req, res) => {
 
         const [{ data: inv }, { data: runs }] = await Promise.all([
             supabase.from('inventory').select('item_type, quantity').eq('wallet', w),
-            supabase.from('dungeon_runs').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(20),
+            supabase.from('dungeon_runs').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(100),
         ]);
 
         const maps = { map_easy: 0, map_medium: 0, map_hard: 0 };
