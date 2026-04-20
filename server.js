@@ -889,11 +889,13 @@ async function repairMiner(wallet, minerId) {
     if (miner.is_alive && !miner.needs_repair) return { error: 'Miner does not need repair' };
 
     const rarity = CONFIG.RARITIES[miner.rarity_id];
-    const cost = rarity.repairPathUSD * CONFIG.DIGCOIN_PER_PATHUSD;
+    const fusedMultiplier = miner.is_fused ? 2 : 1;
+    const repairPathUSD = rarity.repairPathUSD * fusedMultiplier;
+    const cost = repairPathUSD * CONFIG.DIGCOIN_PER_PATHUSD;
 
     const { data: player } = await supabase.from('players').select('digcoin_balance, total_spent_digcoin').eq('wallet', w).single();
     if (player.digcoin_balance < cost) {
-        return { error: `Insufficient balance. Repair costs ${cost} DIGCOIN (${rarity.repairPathUSD} pathUSD)` };
+        return { error: `Insufficient balance. Repair costs ${cost} DIGCOIN (${repairPathUSD} pathUSD)${miner.is_fused ? ' — fused miner rate' : ''}` };
     }
 
     // Atomic relative deduction — safe against concurrent double-spend
@@ -1079,8 +1081,8 @@ app.get('/api/player/:wallet', async (req, res) => {
                 lastDungeonAt: m.last_dungeon_at,
                 lastDungeonType: m.last_dungeon_type || null,
                 dungeonCooldownRemaining: m.last_dungeon_at ? Math.max(0, CONFIG.DUNGEON_COOLDOWN_MS - (Date.now() - new Date(m.last_dungeon_at).getTime())) : 0,
-                repairCostDigcoin: rarity.repairPathUSD * CONFIG.DIGCOIN_PER_PATHUSD,
-                repairCostPathUSD: rarity.repairPathUSD, color: rarity.color,
+                repairCostDigcoin: rarity.repairPathUSD * (m.is_fused ? 2 : 1) * CONFIG.DIGCOIN_PER_PATHUSD,
+                repairCostPathUSD: rarity.repairPathUSD * (m.is_fused ? 2 : 1), color: rarity.color,
             };
         });
 
