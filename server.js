@@ -93,6 +93,19 @@ const CONFIG = {
     REFERRAL_PERCENT: 4,
     PLAY_COOLDOWN_MS: 24 * 60 * 60 * 1000,
     PLAY_ALL_FEE_DIGCOIN: 5,      // fee per miner when using Play All / Claim All
+
+    DUNGEON_COOLDOWN_MS: 60 * 60 * 1000, // 1 hour between dungeon runs
+    DUNGEONS: {
+        easy:   { name: 'Goblins',  mapItem: 'map_easy',   mapCost: 50,  prize: 80,  winChance: 0.45, hpLoss: 25, boxDropChance: 0.02 },
+        medium: { name: 'Spiders',  mapItem: 'map_medium', mapCost: 150, prize: 280, winChance: 0.40, hpLoss: 40, boxDropChance: 0.05 },
+        hard:   { name: 'DigKing',  mapItem: 'map_hard',   mapCost: 400, prize: 900, winChance: 0.35, hpLoss: 60, boxDropChance: 0.10 },
+    },
+    DUNGEON_MAPS: {
+        map_easy:   { name: 'Goblin Map',   price: 50,  dungeonType: 'easy'   },
+        map_medium: { name: 'Spider Map',   price: 150, dungeonType: 'medium' },
+        map_hard:   { name: 'DigKing Map',  price: 400, dungeonType: 'hard'   },
+    },
+    STATS_WIN_BONUS_CAP: 0.10, // max +10% win chance from stats
     AUTO_PICKAXE_PRICE: 3000,     // one-time lifetime purchase
     AUTO_PICKAXE_MAX_SUPPLY: 500, // hard cap
     SIGNATURE_DEADLINE_SECS: 3600,
@@ -465,9 +478,8 @@ async function fuseMiner(wallet, minerId1, minerId2) {
     // Daily = (parent1 + parent2) × 1.20, rounded to 1 decimal
     const fusedDaily = Math.round((m1.daily_digcoin + m2.daily_digcoin) * 1.20 * 10) / 10;
 
-    // Lifespan = parent tier's lifespan (not result tier's)
-    const parentRarity = CONFIG.RARITIES[m1.rarity_id];
-    const fusedLifespan = parentRarity.nftAge;
+    // Lifespan = average of both parents' remaining lifespan
+    const fusedLifespan = Math.max(1, Math.round((m1.nft_age_remaining + m2.nft_age_remaining) / 2));
 
     const stats = generateStats(rarity);
 
@@ -1062,6 +1074,9 @@ app.get('/api/player/:wallet', async (req, res) => {
                 cooldownRemaining,
                 miningEndsAt: m.last_play_at ? new Date(m.last_play_at).getTime() + CONFIG.PLAY_COOLDOWN_MS : null,
                 level: m.level, exp: m.exp, power: m.power, energy: m.energy, protective: m.protective, damage: m.damage,
+                hp: m.hp ?? 100, maxHp: m.max_hp ?? 100,
+                lastDungeonAt: m.last_dungeon_at,
+                dungeonCooldownRemaining: m.last_dungeon_at ? Math.max(0, CONFIG.DUNGEON_COOLDOWN_MS - (Date.now() - new Date(m.last_dungeon_at).getTime())) : 0,
                 repairCostDigcoin: rarity.repairPathUSD * CONFIG.DIGCOIN_PER_PATHUSD,
                 repairCostPathUSD: rarity.repairPathUSD, color: rarity.color,
             };
@@ -1442,6 +1457,184 @@ app.get('/api/history/:wallet', requireAuth, async (req, res) => {
 });
 
 // ════════════════════════════════════════════
+// DUNGEON SYSTEM
+// ════════════════════════════════════════════
+
+// Buy dungeon maps
+app.post('/api/dungeon/buy-map', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
+    try {
+        const { wallet, mapType, quantity = 1 } = req.body;
+        if (!wallet || !isValidAddress(wallet)) return res.status(400).json({ error: 'wallet required' });
+        const w = norm(wallet);
+        const mapDef = CONFIG.DUNGEON_MAPS[mapType];
+        if (!mapDef) return res.status(400).json({ error: 'Invalid map type. Use: map_easy, map_medium, map_hard' });
+        const qty = parseInt(quantity);
+        if (isNaN(qty) || qty < 1 || qty > 50) return res.status(400).json({ error: 'Quantity must be between 1 and 50' });
+
+        const totalCost = mapDef.price * qty;
+        const { data: ok } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: totalCost });
+        if (!ok) return res.status(400).json({ error: `Insufficient balance. ${qty}x ${mapDef.name} costs ${totalCost} DC` });
+
+        // Upsert inventory
+        const { error: invErr } = await supabase.rpc('add_inventory_item', { p_wallet: w, p_item_type: mapType, p_quantity: qty });
+        if (invErr) {
+            await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: totalCost });
+            throw new Error(`Failed to add maps to inventory: ${invErr.message}`);
+        }
+
+        // Feed dungeon pool
+        await supabase.rpc('add_dungeon_pool', { p_amount: totalCost });
+
+        await supabase.from('activity_log').insert({
+            wallet: w, type: 'buy_map',
+            detail: `Bought ${qty}x ${mapDef.name}`,
+            amount_digcoin: totalCost,
+        });
+
+        const { data: inv } = await supabase.from('inventory').select('item_type, quantity').eq('wallet', w);
+        res.json({ success: true, cost: totalCost, inventory: inv || [] });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Run dungeon
+app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
+    try {
+        const { wallet, minerId, dungeonType } = req.body;
+        if (!wallet || !isValidAddress(wallet)) return res.status(400).json({ error: 'wallet required' });
+        if (!minerId || !dungeonType) return res.status(400).json({ error: 'minerId and dungeonType required' });
+        const w = norm(wallet);
+        const mid = parseInt(minerId);
+        if (!isValidMinerId(mid)) return res.status(400).json({ error: 'Invalid miner ID' });
+
+        const dungeon = CONFIG.DUNGEONS[dungeonType];
+        if (!dungeon) return res.status(400).json({ error: 'Invalid dungeon type. Use: easy, medium, hard' });
+
+        // Fetch miner and player
+        const [{ data: miner }, { data: player }, { data: invRow }] = await Promise.all([
+            supabase.from('miners').select('*').eq('id', mid).eq('wallet', w).single(),
+            supabase.from('players').select('digcoin_balance').eq('wallet', w).single(),
+            supabase.from('inventory').select('quantity').eq('wallet', w).eq('item_type', dungeon.mapItem).maybeSingle(),
+        ]);
+
+        if (!miner) return res.status(404).json({ error: 'Miner not found' });
+        if (!miner.is_alive) return res.status(400).json({ error: 'Miner is dead' });
+        if (miner.needs_repair) return res.status(400).json({ error: 'Miner needs repair before entering dungeon' });
+        if (miner.last_play_at) return res.status(400).json({ error: 'Miner is currently mining. Claim first.' });
+
+        const mapQty = invRow?.quantity || 0;
+        if (mapQty < 1) return res.status(400).json({ error: `No ${dungeon.name} maps in inventory. Buy maps first.` });
+
+        // Cooldown check
+        if (miner.last_dungeon_at) {
+            const elapsed = Date.now() - new Date(miner.last_dungeon_at).getTime();
+            if (elapsed < CONFIG.DUNGEON_COOLDOWN_MS) {
+                const remaining = Math.ceil((CONFIG.DUNGEON_COOLDOWN_MS - elapsed) / 1000);
+                return res.status(400).json({ error: `Dungeon cooldown active. Try again in ${Math.ceil(remaining/60)} minutes.`, cooldownRemaining: remaining * 1000 });
+            }
+        }
+
+        // Consume map
+        const { error: mapErr } = await supabase.rpc('spend_inventory_item', { p_wallet: w, p_item_type: dungeon.mapItem, p_quantity: 1 });
+        if (mapErr) return res.status(400).json({ error: 'Failed to consume map. Try again.' });
+
+        // Calculate win chance with stats bonus (cap +10%)
+        const totalStats = (miner.power || 0) + (miner.energy || 0) + (miner.protective || 0) + (miner.damage || 0);
+        const statsBonus = Math.min(totalStats / 100000, CONFIG.STATS_WIN_BONUS_CAP);
+        const finalWinChance = dungeon.winChance + statsBonus;
+
+        const roll = Math.random();
+        const won = roll < finalWinChance;
+
+        let rewardDigcoin = 0;
+        let boxDropped = false;
+        let hpLost = 0;
+        let newHp = miner.hp ?? 100;
+        let needsRepair = false;
+
+        if (won) {
+            rewardDigcoin = dungeon.prize;
+            // Check box drop
+            const boxRoll = Math.random();
+            boxDropped = boxRoll < dungeon.boxDropChance;
+
+            // Award prize from dungeon pool
+            await supabase.rpc('spend_dungeon_pool', { p_amount: rewardDigcoin });
+            await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: rewardDigcoin });
+
+            if (boxDropped) {
+                // Create a free miner box
+                const rarity = CONFIG.RARITIES[Math.floor(Math.random() * CONFIG.RARITIES.length * Math.random())];
+                const rarityIndex = Math.min(Math.floor(Math.random() * CONFIG.RARITIES.length), CONFIG.RARITIES.length - 1);
+                const boxRarity = CONFIG.RARITIES[rarityIndex];
+                const dailyDigcoin = Math.floor(boxRarity.dailyMin + Math.random() * (boxRarity.dailyMax - boxRarity.dailyMin + 1));
+                const stats = generateStats(boxRarity);
+                const { data: newMiner } = await supabase.from('miners').insert({
+                    wallet: w, rarity_id: boxRarity.id, rarity_name: boxRarity.name,
+                    daily_digcoin: dailyDigcoin, nft_age_total: boxRarity.nftAge, nft_age_remaining: boxRarity.nftAge,
+                    hp: 100, max_hp: 100,
+                    ...stats,
+                }).select().single();
+                if (newMiner) {
+                    await supabase.from('box_purchases').insert({ wallet: w, miner_id: newMiner.id, cost_digcoin: 0 });
+                }
+            }
+        } else {
+            hpLost = dungeon.hpLoss;
+            newHp = Math.max(0, (miner.hp ?? 100) - hpLost);
+            needsRepair = newHp <= 0;
+        }
+
+        // Update miner HP + cooldown
+        await supabase.from('miners').update({
+            hp: newHp,
+            needs_repair: needsRepair,
+            is_alive: needsRepair ? false : miner.is_alive,
+            last_dungeon_at: new Date().toISOString(),
+        }).eq('id', mid);
+
+        // Log run
+        await supabase.from('dungeon_runs').insert({
+            wallet: w, miner_id: mid, dungeon_type: dungeonType,
+            result: won ? 'win' : 'loss',
+            reward_digcoin: rewardDigcoin,
+            box_dropped: boxDropped,
+            hp_lost: hpLost,
+        });
+
+        res.json({
+            success: true,
+            result: won ? 'win' : 'loss',
+            dungeonName: dungeon.name,
+            rewardDigcoin,
+            boxDropped,
+            hpLost,
+            newHp,
+            needsRepair,
+            finalWinChance: Math.round(finalWinChance * 100),
+        });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Get inventory
+app.get('/api/dungeon/inventory', requireAuth, async (req, res) => {
+    try {
+        const w = norm(req.query.wallet);
+        if (!w || !isValidAddress(w)) return res.status(400).json({ error: 'wallet required' });
+        if (req.authWallet !== w) return res.status(403).json({ error: 'Forbidden' });
+
+        const [{ data: inv }, { data: runs }] = await Promise.all([
+            supabase.from('inventory').select('item_type, quantity').eq('wallet', w),
+            supabase.from('dungeon_runs').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(20),
+        ]);
+
+        const maps = { map_easy: 0, map_medium: 0, map_hard: 0 };
+        (inv || []).forEach(i => { if (maps.hasOwnProperty(i.item_type)) maps[i.item_type] = i.quantity; });
+
+        res.json({ maps, recentRuns: runs || [] });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ════════════════════════════════════════════
 // ADMIN ROUTES
 // ════════════════════════════════════════════
 
@@ -1461,6 +1654,25 @@ app.post('/api/admin/maintenance', requireAdmin, (req, res) => {
     MAINTENANCE_MODE = !!enabled;
     console.log(`👑 [ADMIN] Maintenance mode → ${MAINTENANCE_MODE}`);
     res.json({ success: true, maintenance: MAINTENANCE_MODE });
+});
+
+// Seed dungeon pool (admin only — house funding)
+app.post('/api/admin/seed-dungeon-pool', requireAdmin, async (req, res) => {
+    try {
+        const { amount } = req.body;
+        const n = parseFloat(amount);
+        if (!n || n <= 0) return res.status(400).json({ error: 'amount required' });
+        await supabase.rpc('add_dungeon_pool', { p_amount: n });
+        await supabase.from('activity_log').insert({
+            wallet: CONFIG.ADMIN_WALLET,
+            type: 'dungeon_pool_seed',
+            detail: `Admin seeded dungeon pool with ${n} DC`,
+            amount_digcoin: n,
+        });
+        const { data: pool } = await supabase.from('dungeon_pool').select('balance_digcoin').eq('id', 1).single();
+        console.log(`👑 [ADMIN] Dungeon pool seeded +${n} DC → total: ${pool?.balance_digcoin}`);
+        res.json({ success: true, newBalance: pool?.balance_digcoin || 0 });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Send DIGCOIN to any wallet (for giveaways, influencers, payments)
@@ -1639,7 +1851,13 @@ app.get('/api/stats', async (req, res) => {
         const { count: aliveMiners } = await supabase.from('miners').select('*', { count: 'exact', head: true }).eq('is_alive', true);
         const { count: landsMinted } = await supabase.from('lands').select('*', { count: 'exact', head: true });
         const { count: autoPickaxesMinted } = await supabase.from('player_perks').select('*', { count: 'exact', head: true }).eq('perk_type', 'auto_pickaxe');
-        const { data: agg } = await supabase.rpc('get_global_stats');
+        const [{ data: agg }, { data: dungeonPool }, { data: recentWins }, { data: totalPaidRow }] = await Promise.all([
+            supabase.rpc('get_global_stats'),
+            supabase.from('dungeon_pool').select('balance_digcoin').eq('id', 1).single(),
+            supabase.from('dungeon_runs').select('wallet,dungeon_type,reward_digcoin,created_at').eq('result', 'win').order('created_at', { ascending: false }).limit(5),
+            supabase.from('dungeon_runs').select('reward_digcoin').eq('result', 'win'),
+        ]);
+        const dungeonTotalPaid = (totalPaidRow || []).reduce((s, r) => s + (parseFloat(r.reward_digcoin) || 0), 0);
         res.json({
             totalPlayers, totalMiners, aliveMiners, ...(agg?.[0] || {}),
             landSaleStartMs: LAND_SALE_START_MS,
@@ -1647,6 +1865,14 @@ app.get('/api/stats', async (req, res) => {
             landMaxSupply: CONFIG.LAND_BOX_MAX_SUPPLY,
             autoPickaxesMinted: autoPickaxesMinted || 0,
             autoPickaxeMaxSupply: CONFIG.AUTO_PICKAXE_MAX_SUPPLY,
+            dungeonPoolBalance: dungeonPool?.balance_digcoin || 0,
+            dungeonTotalPaid,
+            dungeonRecentWins: (recentWins || []).map(r => ({
+                wallet: r.wallet.slice(0, 6) + '...' + r.wallet.slice(-4),
+                dungeonType: r.dungeon_type,
+                reward: r.reward_digcoin,
+                date: r.created_at,
+            })),
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
