@@ -98,25 +98,24 @@ const CONFIG = {
     DUNGEONS: {
         easy:   { name: 'Goblins',  mapItem: 'map_easy',   mapCost: 50,  prize: 80,  winChance: 0.45, hpLoss: 25, boxDropChance: 0.02 },
         medium: { name: 'Spiders',  mapItem: 'map_medium', mapCost: 150, prize: 280, winChance: 0.40, hpLoss: 40, boxDropChance: 0.05 },
-        hard:   { name: 'DigKing',  mapItem: 'map_hard',   mapCost: 400, prize: 900, winChance: 0.35, hpLoss: 60, boxDropChance: 0.10 },
+        hard:   { name: "Miner's Bane",  mapItem: 'map_hard',   mapCost: 400, prize: 900, winChance: 0.35, hpLoss: 60, boxDropChance: 0.10 },
     },
     DUNGEON_MAPS: {
         map_easy:   { name: 'Goblin Map',   price: 50,  dungeonType: 'easy'   },
         map_medium: { name: 'Spider Map',   price: 150, dungeonType: 'medium' },
-        map_hard:   { name: 'DigKing Map',  price: 400, dungeonType: 'hard'   },
+        map_hard:   { name: "Miner's Bane Map",  price: 400, dungeonType: 'hard'   },
     },
-    STATS_WIN_BONUS_CAP: 0.10, // max +10% win chance from stats
     AUTO_PICKAXE_PRICE: 3000,     // one-time lifetime purchase
     AUTO_PICKAXE_MAX_SUPPLY: 500, // hard cap
     SIGNATURE_DEADLINE_SECS: 3600,
 
     RARITIES: [
-        { id: 0, name: 'Common',     chance: 30, dailyMin: 18, dailyMax: 20, nftAge: 19, repairPathUSD: 0.24, color: '#9E9E9E' },
-        { id: 1, name: 'UnCommon',   chance: 30, dailyMin: 21, dailyMax: 23, nftAge: 17, repairPathUSD: 0.40, color: '#4CAF50' },
-        { id: 2, name: 'Rare',       chance: 18, dailyMin: 24, dailyMax: 26, nftAge: 15, repairPathUSD: 0.60, color: '#2196F3' },
-        { id: 3, name: 'Super Rare', chance: 8,  dailyMin: 27, dailyMax: 30, nftAge: 14, repairPathUSD: 0.80, color: '#E91E63' },
-        { id: 4, name: 'Legendary',  chance: 4,  dailyMin: 31, dailyMax: 35, nftAge: 13, repairPathUSD: 1.00, color: '#FF9800' },
-        { id: 5, name: 'Mythic',     chance: 2,  dailyMin: 36, dailyMax: 42, nftAge: 11, repairPathUSD: 1.50, color: '#9C27B0' },
+        { id: 0, name: 'Common',     chance: 30, dailyMin: 18, dailyMax: 20, nftAge: 19, repairPathUSD: 0.24, color: '#9E9E9E', maxHp: 100 },
+        { id: 1, name: 'UnCommon',   chance: 30, dailyMin: 21, dailyMax: 23, nftAge: 17, repairPathUSD: 0.40, color: '#4CAF50', maxHp: 125 },
+        { id: 2, name: 'Rare',       chance: 18, dailyMin: 24, dailyMax: 26, nftAge: 15, repairPathUSD: 0.60, color: '#2196F3', maxHp: 150 },
+        { id: 3, name: 'Super Rare', chance: 8,  dailyMin: 27, dailyMax: 30, nftAge: 14, repairPathUSD: 0.80, color: '#E91E63', maxHp: 200 },
+        { id: 4, name: 'Legendary',  chance: 4,  dailyMin: 31, dailyMax: 35, nftAge: 13, repairPathUSD: 1.00, color: '#FF9800', maxHp: 250 },
+        { id: 5, name: 'Mythic',     chance: 2,  dailyMin: 36, dailyMax: 42, nftAge: 11, repairPathUSD: 1.50, color: '#9C27B0', maxHp: 350 },
     ],
 
     // ── Lands ──────────────────────────────────────────
@@ -319,12 +318,13 @@ async function buyBoxes(wallet, quantity = 1) {
             const { data: miner, error: minerErr } = await supabase.from('miners').insert({
                 wallet: w, rarity_id: rarity.id, rarity_name: rarity.name,
                 daily_digcoin: dailyDigcoin, nft_age_total: rarity.nftAge, nft_age_remaining: rarity.nftAge,
+                hp: rarity.maxHp, max_hp: rarity.maxHp,
                 ...stats,
             }).select().single();
 
             if (minerErr || !miner) throw new Error(minerErr?.message || 'Failed to create miner');
 
-            await supabase.from('box_purchases').insert({ wallet: w, miner_id: miner.id, cost_digcoin: CONFIG.BOX_PRICE_DIGCOIN });
+            await supabase.from('box_purchases').insert({ wallet: w, miner_id: miner.id, cost_digcoin: Math.round(cost / quantity) });
 
             miners.push({
                 id: miner.id, rarityId: rarity.id, rarityName: rarity.name,
@@ -380,9 +380,9 @@ async function buySaleBoxes(wallet, quantity = 1) {
     if (!deducted) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
 
     // Check 2 — post-deduction re-check to close TOCTOU window on sale limits
-    // (concurrent requests may have both passed Check 1 before either inserted box_purchases)
+    // Counts don't include this request yet (boxes not inserted), so add quantity to projected total
     const { totalSold: totalSold2, walletBought: walletBought2 } = await getSaleBoxCounts(w);
-    if (totalSold2 > CONFIG.SALE_BOX_MAX_TOTAL || walletBought2 > CONFIG.SALE_BOX_MAX_PER_WALLET) {
+    if ((totalSold2 + quantity) > CONFIG.SALE_BOX_MAX_TOTAL || (walletBought2 + quantity) > CONFIG.SALE_BOX_MAX_PER_WALLET) {
         // Re-fetch fresh balance to avoid stale-snapshot corruption on refund
         const { error: refundErr } = await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: cost });
         if (refundErr) console.error(`❌ buySaleBoxes limit-exceeded REFUND FAILED for ${w} (${cost} DC): ${refundErr.message}`);
@@ -400,6 +400,7 @@ async function buySaleBoxes(wallet, quantity = 1) {
             const { data: miner, error: minerErr } = await supabase.from('miners').insert({
                 wallet: w, rarity_id: rarity.id, rarity_name: rarity.name,
                 daily_digcoin: dailyDigcoin, nft_age_total: rarity.nftAge, nft_age_remaining: rarity.nftAge,
+                hp: rarity.maxHp, max_hp: rarity.maxHp,
                 ...stats,
             }).select().single();
 
@@ -492,6 +493,7 @@ async function fuseMiner(wallet, minerId1, minerId2) {
         nft_age_total: fusedLifespan,
         nft_age_remaining: fusedLifespan,
         is_fused: true,
+        hp: rarity.maxHp, max_hp: rarity.maxHp,
         ...stats,
     }).select().single();
 
@@ -542,14 +544,10 @@ async function buyLandBox(wallet, quantity = 1) {
     const qty = quantity === CONFIG.LAND_BOX_BULK_QUANTITY ? CONFIG.LAND_BOX_BULK_QUANTITY : 1;
     const cost = qty === CONFIG.LAND_BOX_BULK_QUANTITY ? CONFIG.LAND_BOX_BULK_PRICE_DIGCOIN : CONFIG.LAND_BOX_PRICE_DIGCOIN * qty;
 
-    // Enforce global supply cap — count atomically to prevent race at the limit
-    const { count: totalMinted } = await supabase.from('lands').select('*', { count: 'exact', head: true });
-    const remaining = CONFIG.LAND_BOX_MAX_SUPPLY - (totalMinted || 0);
-    if (remaining <= 0) {
+    // Fast-path supply check (before deduction — just avoids obvious waste)
+    const { count: totalMintedPre } = await supabase.from('lands').select('*', { count: 'exact', head: true });
+    if ((totalMintedPre || 0) >= CONFIG.LAND_BOX_MAX_SUPPLY) {
         return { error: 'All 1000 Mystery Land Boxes have been sold out!' };
-    }
-    if (qty > remaining) {
-        return { error: `Only ${remaining} land box${remaining !== 1 ? 'es' : ''} remaining. Cannot buy ${qty} at once.` };
     }
 
     const player = await getOrCreatePlayer(w);
@@ -558,6 +556,14 @@ async function buyLandBox(wallet, quantity = 1) {
     }
     const { data: ok } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: cost });
     if (!ok) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
+
+    // Post-deduction re-check — projected count must not exceed supply
+    const { count: totalMinted } = await supabase.from('lands').select('*', { count: 'exact', head: true });
+    const remaining = CONFIG.LAND_BOX_MAX_SUPPLY - (totalMinted || 0);
+    if (remaining < qty) {
+        await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: cost });
+        return { error: remaining <= 0 ? 'All 1000 Mystery Land Boxes have been sold out!' : `Only ${remaining} land box${remaining !== 1 ? 'es' : ''} remaining — balance restored.` };
+    }
 
     const lands = [];
     const insertedLandIds = [];
@@ -572,7 +578,7 @@ async function buyLandBox(wallet, quantity = 1) {
             if (landErr || !land) throw new Error(landErr?.message || 'Failed to create land');
 
             insertedLandIds.push(land.id);
-            await supabase.from('land_purchases').insert({ wallet: w, land_id: land.id, cost_digcoin: CONFIG.LAND_BOX_PRICE_DIGCOIN });
+            await supabase.from('land_purchases').insert({ wallet: w, land_id: land.id, cost_digcoin: Math.round(cost / qty) });
 
             lands.push({
                 id: land.id, rarityId: rarity.id, rarityName: rarity.name,
@@ -904,7 +910,7 @@ async function repairMiner(wallet, minerId) {
 
     const { error: minerUpdateErr } = await supabase.from('miners').update({
         nft_age_remaining: miner.nft_age_total, is_alive: true, needs_repair: false,
-        hp: miner.max_hp ?? 100,
+        hp: rarity.maxHp,
     }).eq('id', minerId);
 
     if (minerUpdateErr) {
@@ -916,7 +922,7 @@ async function repairMiner(wallet, minerId) {
 
     await supabase.from('repairs').insert({ wallet: w, miner_id: minerId, cost_digcoin: cost });
 
-    return { success: true, costDigcoin: cost, costPathUSD: rarity.repairPathUSD };
+    return { success: true, costDigcoin: cost, costPathUSD: repairPathUSD };
 }
 
 // ════════════════════════════════════════════
@@ -1284,6 +1290,13 @@ app.post('/api/buy-auto-pickaxe', financialLimit, checkMaintenance, requireAuth,
         const { data: ok } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: CONFIG.AUTO_PICKAXE_PRICE });
         if (!ok) return res.status(400).json({ error: `Insufficient balance. Auto Pickaxe costs ${CONFIG.AUTO_PICKAXE_PRICE} DIGCOIN` });
 
+        // Post-deduction re-check to close race window on supply cap
+        const { count: supplyNow } = await supabase.from('player_perks').select('*', { count: 'exact', head: true }).eq('perk_type', 'auto_pickaxe');
+        if ((supplyNow || 0) >= CONFIG.AUTO_PICKAXE_MAX_SUPPLY) {
+            await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: CONFIG.AUTO_PICKAXE_PRICE });
+            return res.status(400).json({ error: `Auto Pickaxe sold out — balance restored.` });
+        }
+
         const { error: insertErr } = await supabase.from('player_perks').insert({ wallet: w, perk_type: 'auto_pickaxe', active: true });
         if (insertErr) {
             await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: CONFIG.AUTO_PICKAXE_PRICE });
@@ -1548,10 +1561,14 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
         const { error: mapErr } = await supabase.rpc('spend_inventory_item', { p_wallet: w, p_item_type: dungeon.mapItem, p_quantity: 1 });
         if (mapErr) return res.status(400).json({ error: 'Failed to consume map. Try again.' });
 
-        // Calculate win chance with stats bonus (cap +10%)
-        const totalStats = (miner.power || 0) + (miner.energy || 0) + (miner.protective || 0) + (miner.damage || 0);
-        const statsBonus = Math.min(totalStats / 100000, CONFIG.STATS_WIN_BONUS_CAP);
-        const finalWinChance = dungeon.winChance + statsBonus;
+        // Post-consumption re-check — guards against concurrent winners draining the pool
+        const { data: poolRecheck } = await supabase.from('dungeon_pool').select('balance_digcoin').eq('id', 1).single();
+        if (parseFloat(poolRecheck?.balance_digcoin || 0) < dungeon.prize) {
+            await supabase.rpc('add_inventory_item', { p_wallet: w, p_item_type: dungeon.mapItem, p_quantity: 1 });
+            return res.status(400).json({ error: 'Dungeon temporarily closed — prize pool is refilling. Map returned to inventory.' });
+        }
+
+        const finalWinChance = dungeon.winChance;
 
         const roll = Math.random();
         const won = roll < finalWinChance;
@@ -1573,15 +1590,14 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
             await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: rewardDigcoin });
 
             if (boxDropped) {
-                // Create a free miner box
-                const rarityIndex = Math.min(Math.floor(Math.random() * CONFIG.RARITIES.length), CONFIG.RARITIES.length - 1);
-                const boxRarity = CONFIG.RARITIES[rarityIndex];
+                // Create a free miner box using weighted rarity (same as normal box purchase)
+                const boxRarity = rollRarity();
                 const dailyDigcoin = Math.floor(boxRarity.dailyMin + Math.random() * (boxRarity.dailyMax - boxRarity.dailyMin + 1));
                 const stats = generateStats(boxRarity);
                 const { data: newMiner } = await supabase.from('miners').insert({
                     wallet: w, rarity_id: boxRarity.id, rarity_name: boxRarity.name,
                     daily_digcoin: dailyDigcoin, nft_age_total: boxRarity.nftAge, nft_age_remaining: boxRarity.nftAge,
-                    hp: 100, max_hp: 100,
+                    hp: boxRarity.maxHp, max_hp: boxRarity.maxHp,
                     ...stats,
                 }).select().single();
                 if (newMiner) {
