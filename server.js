@@ -94,7 +94,7 @@ const CONFIG = {
     PLAY_COOLDOWN_MS: 24 * 60 * 60 * 1000,
     PLAY_ALL_FEE_DIGCOIN: 5,      // fee per miner when using Play All / Claim All
 
-    DUNGEON_COOLDOWN_MS: 60 * 1000, // 1 minute between dungeon runs
+    DUNGEON_COOLDOWN_MS: 20 * 1000, // 20 seconds between dungeon runs
     DUNGEONS: {
         easy:   { name: 'Goblins',  mapItem: 'map_easy',   mapCost: 50,  prize: 80,  winChance: 0.45, hpLoss: 25, boxDropChance: 0.02 },
         medium: { name: 'Spiders',  mapItem: 'map_medium', mapCost: 150, prize: 280, winChance: 0.40, hpLoss: 40, boxDropChance: 0.05 },
@@ -1546,7 +1546,7 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
             const elapsed = Date.now() - new Date(miner.last_dungeon_at).getTime();
             if (elapsed < CONFIG.DUNGEON_COOLDOWN_MS) {
                 const remaining = Math.ceil((CONFIG.DUNGEON_COOLDOWN_MS - elapsed) / 1000);
-                return res.status(400).json({ error: `Dungeon cooldown active. Try again in ${Math.ceil(remaining/60)} minutes.`, cooldownRemaining: remaining * 1000 });
+                return res.status(400).json({ error: `Dungeon cooldown active. Try again in ${remaining} seconds.`, cooldownRemaining: remaining * 1000 });
             }
         }
 
