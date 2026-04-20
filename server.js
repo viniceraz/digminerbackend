@@ -1799,16 +1799,25 @@ app.get('/api/admin/dungeon-runs-by-day', requireAdmin, async (req, res) => {
         if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'date param required (YYYY-MM-DD)' });
         const from = `${date}T00:00:00.000Z`;
         const to   = `${date}T23:59:59.999Z`;
-        const { data: rows } = await supabase.from('dungeon_runs')
-            .select('wallet, miner_id, dungeon_type, result, reward_digcoin, box_dropped, hp_lost, created_at')
-            .gte('created_at', from).lte('created_at', to)
-            .order('created_at', { ascending: false });
+        const [{ data: rows }, { data: mapRows }] = await Promise.all([
+            supabase.from('dungeon_runs')
+                .select('wallet, miner_id, dungeon_type, result, reward_digcoin, box_dropped, hp_lost, created_at')
+                .gte('created_at', from).lte('created_at', to)
+                .order('created_at', { ascending: false }),
+            supabase.from('activity_log')
+                .select('wallet, detail, amount_digcoin, created_at')
+                .eq('type', 'buy_map')
+                .gte('created_at', from).lte('created_at', to)
+                .order('created_at', { ascending: false }),
+        ]);
         const list = rows || [];
-        const wins       = list.filter(r => r.result === 'win').length;
-        const losses     = list.filter(r => r.result === 'loss').length;
-        const totalPaid  = list.reduce((s, r) => s + (parseFloat(r.reward_digcoin) || 0), 0);
-        const boxDrops   = list.filter(r => r.box_dropped).length;
-        res.json({ date, runs: list, total: list.length, wins, losses, totalPaid, boxDrops });
+        const maps = mapRows || [];
+        const wins          = list.filter(r => r.result === 'win').length;
+        const losses        = list.filter(r => r.result === 'loss').length;
+        const totalPaid     = list.reduce((s, r) => s + (parseFloat(r.reward_digcoin) || 0), 0);
+        const boxDrops      = list.filter(r => r.box_dropped).length;
+        const totalMapSpent = maps.reduce((s, m) => s + (parseFloat(m.amount_digcoin) || 0), 0);
+        res.json({ date, runs: list, total: list.length, wins, losses, totalPaid, boxDrops, maps, totalMapSpent });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
