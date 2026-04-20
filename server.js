@@ -1803,11 +1803,13 @@ app.get('/api/admin/dungeon-runs-by-day', requireAdmin, async (req, res) => {
             supabase.from('dungeon_runs')
                 .select('wallet, miner_id, dungeon_type, result, reward_digcoin, box_dropped, hp_lost, created_at')
                 .gte('created_at', from).lte('created_at', to)
+                .neq('wallet', CONFIG.ADMIN_WALLET)
                 .order('created_at', { ascending: false }),
             supabase.from('activity_log')
                 .select('wallet, detail, amount_digcoin, created_at')
                 .eq('type', 'buy_map')
                 .gte('created_at', from).lte('created_at', to)
+                .neq('wallet', CONFIG.ADMIN_WALLET)
                 .order('created_at', { ascending: false }),
         ]);
         const list = rows || [];
