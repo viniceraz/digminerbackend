@@ -1574,7 +1574,6 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
 
             if (boxDropped) {
                 // Create a free miner box
-                const rarity = CONFIG.RARITIES[Math.floor(Math.random() * CONFIG.RARITIES.length * Math.random())];
                 const rarityIndex = Math.min(Math.floor(Math.random() * CONFIG.RARITIES.length), CONFIG.RARITIES.length - 1);
                 const boxRarity = CONFIG.RARITIES[rarityIndex];
                 const dailyDigcoin = Math.floor(boxRarity.dailyMin + Math.random() * (boxRarity.dailyMax - boxRarity.dailyMin + 1));
