@@ -902,6 +902,7 @@ async function repairMiner(wallet, minerId) {
 
     const { error: minerUpdateErr } = await supabase.from('miners').update({
         nft_age_remaining: miner.nft_age_total, is_alive: true, needs_repair: false,
+        hp: miner.max_hp ?? 100,
     }).eq('id', minerId);
 
     if (minerUpdateErr) {
