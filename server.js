@@ -122,7 +122,7 @@ const CONFIG = {
     LAND_BOX_PRICE_DIGCOIN: 300,       // 3 pathUSD
     LAND_BOX_BULK_QUANTITY: 10,
     LAND_BOX_BULK_PRICE_DIGCOIN: 2550, // 10 boxes = 15% off (25.50 pathUSD)
-    LAND_BOX_MAX_SUPPLY: 1000,         // total land boxes ever mintable
+    LAND_BOX_MAX_SUPPLY: 500,          // total land boxes ever mintable
     LAND_RARITIES: [
         { id: 0, name: 'Common',     chance: 35, boostPercent: 5,  minerSlots: 2, color: '#9E9E9E' },
         { id: 1, name: 'UnCommon',   chance: 28, boostPercent: 10, minerSlots: 3, color: '#4CAF50' },
