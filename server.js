@@ -96,14 +96,16 @@ const CONFIG = {
 
     DUNGEON_COOLDOWN_MS: 20 * 1000, // 20 seconds between dungeon runs
     DUNGEONS: {
-        easy:   { name: 'Goblins',  mapItem: 'map_easy',   mapCost: 50,  prize: 80,  winChance: 0.45, hpLoss: 25, boxDropChance: 0.02 },
-        medium: { name: 'Spiders',  mapItem: 'map_medium', mapCost: 150, prize: 280, winChance: 0.40, hpLoss: 40, boxDropChance: 0.05 },
-        hard:   { name: "Miner's Bane",  mapItem: 'map_hard',   mapCost: 400, prize: 900, winChance: 0.35, hpLoss: 60, boxDropChance: 0.10 },
+        easy:     { name: 'Goblins',     mapItem: 'map_easy',     mapCost: 50,  prize: 80,  winChance: 0.45, hpLoss: 25, boxDropChance: 0.02 },
+        medium:   { name: 'Spiders',     mapItem: 'map_medium',   mapCost: 150, prize: 280, winChance: 0.40, hpLoss: 40, boxDropChance: 0.05 },
+        hard:     { name: "Miner's Bane",mapItem: 'map_hard',     mapCost: 400, prize: 900, winChance: 0.35, hpLoss: 60, boxDropChance: 0.10 },
+        weremole: { name: 'Weremole Lair',mapItem: 'map_weremole', mapCost: 400, prize: 0,   winChance: 0.10, hpLoss: 30, boxDropChance: 0, weremoleDungeon: true },
     },
     DUNGEON_MAPS: {
-        map_easy:   { name: 'Goblin Map',   price: 50,  dungeonType: 'easy'   },
-        map_medium: { name: 'Spider Map',   price: 150, dungeonType: 'medium' },
-        map_hard:   { name: "Miner's Bane Map",  price: 400, dungeonType: 'hard'   },
+        map_easy:     { name: 'Goblin Map',        price: 50,  dungeonType: 'easy'     },
+        map_medium:   { name: 'Spider Map',        price: 150, dungeonType: 'medium'   },
+        map_hard:     { name: "Miner's Bane Map",  price: 400, dungeonType: 'hard'     },
+        map_weremole: { name: 'Weremole Map',      price: 400, dungeonType: 'weremole' },
     },
     AUTO_PICKAXE_PRICE: 3000,     // one-time lifetime purchase
     AUTO_PICKAXE_MAX_SUPPLY: 500, // hard cap
@@ -116,6 +118,20 @@ const CONFIG = {
         { id: 3, name: 'Super Rare', chance: 8,  dailyMin: 27, dailyMax: 30, nftAge: 14, repairPathUSD: 0.80, color: '#E91E63', maxHp: 200 },
         { id: 4, name: 'Legendary',  chance: 4,  dailyMin: 31, dailyMax: 35, nftAge: 13, repairPathUSD: 1.00, color: '#FF9800', maxHp: 250 },
         { id: 5, name: 'Mythic',     chance: 2,  dailyMin: 36, dailyMax: 42, nftAge: 11, repairPathUSD: 1.50, color: '#9C27B0', maxHp: 350 },
+    ],
+
+    // ── Season 2 ───────────────────────────────────────
+    S2_BOX_PRICE_DIGCOIN: 400,
+    S2_BOX_10_PRICE_DIGCOIN: Math.round(400*10*0.95),   // 3800 DC (5% off)
+    S2_BOX_100_PRICE_DIGCOIN: Math.round(400*100*0.90), // 36000 DC (10% off)
+    S2_BOX_MAX_SUPPLY: 1000,
+    S2_RARITIES: [
+        { id: 0, name: 'Common',     chance: 30, dailyMin: 38, dailyMax: 42, nftAge: 13, repairPathUSD: 0.40, color: '#9E9E9E', maxHp: 100 },
+        { id: 1, name: 'UnCommon',   chance: 30, dailyMin: 43, dailyMax: 47, nftAge: 12, repairPathUSD: 0.65, color: '#4CAF50', maxHp: 125 },
+        { id: 2, name: 'Rare',       chance: 18, dailyMin: 48, dailyMax: 53, nftAge: 11, repairPathUSD: 1.00, color: '#2196F3', maxHp: 150 },
+        { id: 3, name: 'Super Rare', chance: 8,  dailyMin: 55, dailyMax: 60, nftAge: 10, repairPathUSD: 1.40, color: '#E91E63', maxHp: 200 },
+        { id: 4, name: 'Legendary',  chance: 4,  dailyMin: 64, dailyMax: 70, nftAge: 9,  repairPathUSD: 1.80, color: '#FF9800', maxHp: 250 },
+        { id: 5, name: 'Mythic',     chance: 2,  dailyMin: 76, dailyMax: 85, nftAge: 8,  repairPathUSD: 2.80, color: '#9C27B0', maxHp: 350 },
     ],
 
     // ── Lands ──────────────────────────────────────────
@@ -135,6 +151,22 @@ const CONFIG = {
 
 // Land sale opens 240 minutes after first server boot (persists for the process lifetime)
 const LAND_SALE_START_MS = 1776296008834; // Fixed: 2026-04-15T23:33:28 UTC — does not reset on server restart
+
+// S2 launch timestamp — set once in DB on first boot, never overwritten on restart
+let S2_LAUNCH_AT_MS = Infinity; // safe default: locked until DB value loads
+async function initS2LaunchTime() {
+    const launchDate = new Date(Date.now() + 15 * 60 * 60 * 1000).toISOString();
+    // Insert only if key doesn't exist yet
+    await supabase.from('game_config').upsert(
+        { key: 's2_launch_at', value: launchDate },
+        { onConflict: 'key', ignoreDuplicates: true }
+    );
+    const { data } = await supabase.from('game_config').select('value').eq('key', 's2_launch_at').single();
+    if (data?.value) {
+        S2_LAUNCH_AT_MS = new Date(data.value).getTime();
+        console.log(`🌟 S2 launch at: ${data.value} (${S2_LAUNCH_AT_MS > Date.now() ? 'PENDING' : 'LIVE'})`);
+    }
+}
 
 // ════════════════════════════════════════════
 // AUTH (EIP-191 wallet signatures)
@@ -431,6 +463,75 @@ async function buySaleBoxes(wallet, quantity = 1) {
 }
 
 // ════════════════════════════════════════════
+// SEASON 2 BOX
+// ════════════════════════════════════════════
+function rollS2Rarity() {
+    const rarities = CONFIG.S2_RARITIES;
+    const total = rarities.reduce((s, r) => s + r.chance, 0);
+    let roll = Math.random() * total;
+    for (const r of rarities) { roll -= r.chance; if (roll <= 0) return r; }
+    return rarities[rarities.length - 1];
+}
+
+async function buyS2Boxes(wallet, quantity = 1) {
+    const w = norm(wallet);
+    const cost = quantity===100 ? CONFIG.S2_BOX_100_PRICE_DIGCOIN
+               : quantity===10  ? CONFIG.S2_BOX_10_PRICE_DIGCOIN
+               : CONFIG.S2_BOX_PRICE_DIGCOIN * quantity;
+    const price = Math.round(cost / quantity);
+
+    const { data: player } = await supabase.from('players').select('digcoin_balance').eq('wallet', w).single();
+    if (!player) return { error: 'Player not found' };
+    if (player.digcoin_balance < cost) return { error: `Insufficient balance. Need ${cost} DIGCOIN` };
+
+    const { count: totalSold } = await supabase.from('box_purchases').select('*', { count: 'exact', head: true }).eq('box_type', 's2');
+    if ((totalSold || 0) + quantity > CONFIG.S2_BOX_MAX_SUPPLY)
+        return { error: `Only ${CONFIG.S2_BOX_MAX_SUPPLY - (totalSold || 0)} S2 boxes remaining` };
+
+    const { data: ok } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: cost });
+    if (!ok) return { error: 'Insufficient balance (concurrent update conflict — try again)' };
+
+    const miners = [];
+    const insertedMinerIds = [];
+    try {
+        for (let i = 0; i < quantity; i++) {
+            const rarity = rollS2Rarity();
+            const dailyDigcoin = randBetween(rarity.dailyMin, rarity.dailyMax);
+            const stats = generateStats(rarity);
+
+            const { data: miner, error: minerErr } = await supabase.from('miners').insert({
+                wallet: w, rarity_id: rarity.id, rarity_name: rarity.name,
+                daily_digcoin: dailyDigcoin, nft_age_total: rarity.nftAge, nft_age_remaining: rarity.nftAge,
+                hp: rarity.maxHp, max_hp: rarity.maxHp, season: 2,
+                ...stats,
+            }).select().single();
+
+            if (minerErr || !miner) throw new Error(minerErr?.message || 'Failed to create S2 miner');
+            insertedMinerIds.push(miner.id);
+
+            await supabase.from('box_purchases').insert({ wallet: w, miner_id: miner.id, cost_digcoin: price, box_type: 's2' });
+
+            miners.push({
+                id: miner.id, rarityId: rarity.id, rarityName: rarity.name,
+                dailyDigcoin, nftAge: rarity.nftAge, color: rarity.color, season: 2, ...stats,
+                roi: Math.ceil(price / dailyDigcoin),
+            });
+        }
+        await supabase.rpc('add_digcoin', { p_wallet: w, p_boxes: quantity });
+    } catch (insertErr) {
+        if (insertedMinerIds.length > 0) {
+            await supabase.from('box_purchases').delete().in('miner_id', insertedMinerIds).eq('box_type', 's2');
+            await supabase.from('miners').delete().in('id', insertedMinerIds);
+        }
+        const { error: refundErr } = await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: cost });
+        if (refundErr) console.error(`❌ buyS2Boxes REFUND FAILED for ${w} (${cost} DC): ${refundErr.message}`);
+        return { error: 'Failed to open S2 box — balance restored, please try again' };
+    }
+
+    return { success: true, miners, cost, s2Box: true };
+}
+
+// ════════════════════════════════════════════
 // FUSE MINERS
 // ════════════════════════════════════════════
 
@@ -453,6 +554,12 @@ async function fuseMiner(wallet, minerId1, minerId2) {
 
     // Cannot fuse Mythic (highest tier — no tier above)
     if (m1.rarity_id >= 5) return { error: 'Mythic miners are already the highest tier and cannot be fused.' };
+
+    // Cannot fuse Season 2 or Season 3 (Weremole) miners
+    if (m1.season === 2) return { error: `Miner #${minerId1} is a Season 2 miner and cannot be fused.` };
+    if (m2.season === 2) return { error: `Miner #${minerId2} is a Season 2 miner and cannot be fused.` };
+    if (m1.season === 3) return { error: `Miner #${minerId1} is a Weremole and cannot be fused.` };
+    if (m2.season === 3) return { error: `Miner #${minerId2} is a Weremole and cannot be fused.` };
 
     // Cannot fuse already-fused miners
     if (m1.is_fused) return { error: `Miner #${minerId1} is already a Fused miner and cannot be fused again.` };
@@ -736,8 +843,9 @@ async function claimMiner(wallet, minerId) {
         if (land) boostPercent = land.boost_percent;
     }
     const reward = Math.round(miner.daily_digcoin * (1 + boostPercent / 100) * 100) / 100;
-    const newAge = miner.nft_age_remaining - 1;
-    const isDead = newAge <= 0;
+    // Season 3 (Weremole) miners are permanent — age never decrements
+    const newAge = miner.season === 3 ? miner.nft_age_remaining : miner.nft_age_remaining - 1;
+    const isDead = miner.season === 3 ? false : newAge <= 0;
 
     // Atomic miner state transition: only succeeds if last_play_at is still set.
     // This prevents double-claim from concurrent requests (second update finds last_play_at=null → 0 rows → rejected).
@@ -892,9 +1000,11 @@ async function repairMiner(wallet, minerId) {
     const { data: miner } = await supabase.from('miners').select('*').eq('id', minerId).eq('wallet', w).single();
 
     if (!miner) return { error: 'Miner not found' };
+    if (miner.season === 3) return { error: 'Weremole miners never need repair.' };
     if (miner.is_alive && !miner.needs_repair) return { error: 'Miner does not need repair' };
 
-    const rarity = CONFIG.RARITIES[miner.rarity_id];
+    const rarityConfig = miner.season === 2 ? CONFIG.S2_RARITIES : CONFIG.RARITIES;
+    const rarity = rarityConfig[miner.rarity_id];
     const fusedMultiplier = miner.is_fused ? 2 : 1;
     const repairPathUSD = rarity.repairPathUSD * fusedMultiplier;
     const cost = repairPathUSD * CONFIG.DIGCOIN_PER_PATHUSD;
@@ -1057,8 +1167,9 @@ app.get('/api/player/:wallet', async (req, res) => {
         ]);
 
         const now = Date.now();
+        const WEREMOLE_RARITY_FALLBACK = { repairPathUSD: 0, maxHp: 100, color: '#8B4513' };
         const mapped = (miners || []).map(m => {
-            const rarity = CONFIG.RARITIES[m.rarity_id];
+            const rarity = m.season === 3 ? WEREMOLE_RARITY_FALLBACK : (CONFIG.RARITIES[m.rarity_id] || CONFIG.S2_RARITIES[m.rarity_id] || WEREMOLE_RARITY_FALLBACK);
             const healthy = m.is_alive && !m.needs_repair;
             let isIdle = false, isMining = false, canClaim = false, cooldownRemaining = 0;
             if (healthy) {
@@ -1077,7 +1188,7 @@ app.get('/api/player/:wallet', async (req, res) => {
             return {
                 id: m.id, rarityId: m.rarity_id, rarityName: m.rarity_name,
                 dailyDigcoin: m.daily_digcoin, nftAgeTotal: m.nft_age_total, nftAgeRemaining: m.nft_age_remaining,
-                isAlive: m.is_alive, needsRepair: m.needs_repair, isFused: !!m.is_fused,
+                isAlive: m.is_alive, needsRepair: m.needs_repair, isFused: !!m.is_fused, season: m.season || 1,
                 isIdle, isMining, canClaim,
                 canPlay: canClaim, // backward compat alias
                 cooldownRemaining,
@@ -1193,6 +1304,21 @@ app.post('/api/box/buy-sale', financialLimit, checkMaintenance, requireAuth, asy
         if (!wallet) return res.status(400).json({ error: 'wallet required' });
         const qty = Math.max(1, Math.min(parseInt(quantity) || 1, CONFIG.SALE_BOX_MAX_PER_WALLET));
         const result = await buySaleBoxes(wallet, qty);
+        if (result.error) return res.status(400).json(result);
+        res.json(result);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/box/buy-s2', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
+    try {
+        if (Date.now() < S2_LAUNCH_AT_MS) {
+            const secsLeft = Math.ceil((S2_LAUNCH_AT_MS - Date.now()) / 1000);
+            return res.status(400).json({ error: `Season 2 has not launched yet. Available in ${secsLeft} seconds.` });
+        }
+        const { wallet, quantity } = req.body;
+        if (!wallet) return res.status(400).json({ error: 'wallet required' });
+        const qty = Math.max(1, Math.min(parseInt(quantity) || 1, 100));
+        const result = await buyS2Boxes(wallet, qty);
         if (result.error) return res.status(400).json(result);
         res.json(result);
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1482,6 +1608,10 @@ app.post('/api/dungeon/buy-map', financialLimit, checkMaintenance, requireAuth, 
     try {
         const { wallet, mapType, quantity = 1 } = req.body;
         if (!wallet || !isValidAddress(wallet)) return res.status(400).json({ error: 'wallet required' });
+        if (mapType === 'map_weremole' && Date.now() < S2_LAUNCH_AT_MS) {
+            const secsLeft = Math.ceil((S2_LAUNCH_AT_MS - Date.now()) / 1000);
+            return res.status(400).json({ error: `Weremole Lair has not opened yet. Available in ${secsLeft} seconds.` });
+        }
         const w = norm(wallet);
         const mapDef = CONFIG.DUNGEON_MAPS[mapType];
         if (!mapDef) return res.status(400).json({ error: 'Invalid map type. Use: map_easy, map_medium, map_hard' });
@@ -1524,7 +1654,7 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
         if (!isValidMinerId(mid)) return res.status(400).json({ error: 'Invalid miner ID' });
 
         const dungeon = CONFIG.DUNGEONS[dungeonType];
-        if (!dungeon) return res.status(400).json({ error: 'Invalid dungeon type. Use: easy, medium, hard' });
+        if (!dungeon) return res.status(400).json({ error: 'Invalid dungeon type.' });
 
         // Fetch miner and player
         const [{ data: miner }, { data: player }, { data: invRow }] = await Promise.all([
@@ -1538,6 +1668,16 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
         if (miner.needs_repair) return res.status(400).json({ error: 'Miner needs repair before entering dungeon' });
         if (miner.last_play_at) return res.status(400).json({ error: 'Miner is currently mining. Claim first.' });
 
+        // Weremole dungeon requires at least one idle miner (besides the one being sent)
+        if (dungeon.weremoleDungeon) {
+            const { data: idleMiners } = await supabase.from('miners')
+                .select('id').eq('wallet', w).eq('is_alive', true).eq('needs_repair', false).is('last_play_at', null);
+            const idleOthers = (idleMiners || []).filter(m => m.id !== mid);
+            if (idleOthers.length === 0) {
+                return res.status(400).json({ error: 'Weremole Lair requires at least one other idle miner to watch the base.' });
+            }
+        }
+
         const mapQty = invRow?.quantity || 0;
         if (mapQty < 1) return res.status(400).json({ error: `No ${dungeon.name} maps in inventory. Buy maps first.` });
 
@@ -1550,22 +1690,26 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
             }
         }
 
-        // Check dungeon pool has enough to cover the prize
-        const { data: poolRow } = await supabase.from('dungeon_pool').select('balance_digcoin').eq('id', 1).single();
-        const poolBalance = parseFloat(poolRow?.balance_digcoin || 0);
-        if (poolBalance < dungeon.prize) {
-            return res.status(400).json({ error: `Dungeon temporarily closed — prize pool is refilling. Check back soon!` });
+        // Check dungeon pool has enough to cover the prize (skip for weremole — no DC prize)
+        if (!dungeon.weremoleDungeon) {
+            const { data: poolRow } = await supabase.from('dungeon_pool').select('balance_digcoin').eq('id', 1).single();
+            const poolBalance = parseFloat(poolRow?.balance_digcoin || 0);
+            if (poolBalance < dungeon.prize) {
+                return res.status(400).json({ error: `Dungeon temporarily closed — prize pool is refilling. Check back soon!` });
+            }
         }
 
         // Consume map
         const { error: mapErr } = await supabase.rpc('spend_inventory_item', { p_wallet: w, p_item_type: dungeon.mapItem, p_quantity: 1 });
         if (mapErr) return res.status(400).json({ error: 'Failed to consume map. Try again.' });
 
-        // Post-consumption re-check — guards against concurrent winners draining the pool
-        const { data: poolRecheck } = await supabase.from('dungeon_pool').select('balance_digcoin').eq('id', 1).single();
-        if (parseFloat(poolRecheck?.balance_digcoin || 0) < dungeon.prize) {
-            await supabase.rpc('add_inventory_item', { p_wallet: w, p_item_type: dungeon.mapItem, p_quantity: 1 });
-            return res.status(400).json({ error: 'Dungeon temporarily closed — prize pool is refilling. Map returned to inventory.' });
+        // Post-consumption re-check — guards against concurrent winners draining the pool (skip for weremole)
+        if (!dungeon.weremoleDungeon) {
+            const { data: poolRecheck } = await supabase.from('dungeon_pool').select('balance_digcoin').eq('id', 1).single();
+            if (parseFloat(poolRecheck?.balance_digcoin || 0) < dungeon.prize) {
+                await supabase.rpc('add_inventory_item', { p_wallet: w, p_item_type: dungeon.mapItem, p_quantity: 1 });
+                return res.status(400).json({ error: 'Dungeon temporarily closed — prize pool is refilling. Map returned to inventory.' });
+            }
         }
 
         const finalWinChance = dungeon.winChance;
@@ -1579,35 +1723,61 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
         let newHp = miner.hp ?? 100;
         let needsRepair = false;
 
+        let weremoleMiner = null;
         if (won) {
-            rewardDigcoin = dungeon.prize;
-            // Check box drop
-            const boxRoll = Math.random();
-            boxDropped = boxRoll < dungeon.boxDropChance;
-
-            // Award prize from dungeon pool
-            await supabase.rpc('spend_dungeon_pool', { p_amount: rewardDigcoin });
-            await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: rewardDigcoin });
-
-            if (boxDropped) {
-                // Create a free miner box using weighted rarity (same as normal box purchase)
-                const boxRarity = rollRarity();
-                const dailyDigcoin = Math.floor(boxRarity.dailyMin + Math.random() * (boxRarity.dailyMax - boxRarity.dailyMin + 1));
-                const stats = generateStats(boxRarity);
-                const { data: newMiner } = await supabase.from('miners').insert({
-                    wallet: w, rarity_id: boxRarity.id, rarity_name: boxRarity.name,
-                    daily_digcoin: dailyDigcoin, nft_age_total: boxRarity.nftAge, nft_age_remaining: boxRarity.nftAge,
-                    hp: boxRarity.maxHp, max_hp: boxRarity.maxHp,
-                    ...stats,
+            if (dungeon.weremoleDungeon) {
+                // Prize is a permanent Weremole miner (season=3), no DC awarded
+                const { data: newWeremole } = await supabase.from('miners').insert({
+                    wallet: w,
+                    rarity_id: 'weremole',
+                    rarity_name: 'Weremole',
+                    daily_digcoin: 30,
+                    nft_age_total: 9999,
+                    nft_age_remaining: 9999,
+                    hp: 100,
+                    max_hp: 100,
+                    season: 3,
+                    is_alive: true,
+                    needs_repair: false,
+                    level: 1,
+                    exp: 0,
+                    power: 999,
+                    energy: 999,
+                    protective: 999,
+                    damage: 99,
                 }).select().single();
-                if (newMiner) {
-                    await supabase.from('box_purchases').insert({ wallet: w, miner_id: newMiner.id, cost_digcoin: 0 });
+                weremoleMiner = newWeremole;
+            } else {
+                rewardDigcoin = dungeon.prize;
+                const boxRoll = Math.random();
+                boxDropped = boxRoll < dungeon.boxDropChance;
+
+                // Award prize from dungeon pool
+                await supabase.rpc('spend_dungeon_pool', { p_amount: rewardDigcoin });
+                await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: rewardDigcoin });
+
+                if (boxDropped) {
+                    const boxRarity = rollRarity();
+                    const dailyDigcoin = Math.floor(boxRarity.dailyMin + Math.random() * (boxRarity.dailyMax - boxRarity.dailyMin + 1));
+                    const stats = generateStats(boxRarity);
+                    const { data: newMiner } = await supabase.from('miners').insert({
+                        wallet: w, rarity_id: boxRarity.id, rarity_name: boxRarity.name,
+                        daily_digcoin: dailyDigcoin, nft_age_total: boxRarity.nftAge, nft_age_remaining: boxRarity.nftAge,
+                        hp: boxRarity.maxHp, max_hp: boxRarity.maxHp,
+                        ...stats,
+                    }).select().single();
+                    if (newMiner) {
+                        await supabase.from('box_purchases').insert({ wallet: w, miner_id: newMiner.id, cost_digcoin: 0 });
+                    }
                 }
             }
         } else {
             hpLost = dungeon.hpLoss;
-            newHp = Math.max(0, (miner.hp ?? 100) - hpLost);
-            needsRepair = newHp <= 0;
+            // Weremole is permanent — HP floors at 1, never dies or needs repair
+            newHp = miner.season === 3
+                ? Math.max(1, (miner.hp ?? 100) - hpLost)
+                : Math.max(0, (miner.hp ?? 100) - hpLost);
+            needsRepair = miner.season === 3 ? false : newHp <= 0;
         }
 
         // Update miner HP + cooldown
@@ -1639,6 +1809,7 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
             maxHp: CONFIG.RARITIES[miner.rarity_id]?.maxHp ?? 100,
             needsRepair,
             finalWinChance: Math.round(finalWinChance * 100),
+            weremoleMiner: weremoleMiner ? { id: weremoleMiner.id, dailyDigcoin: weremoleMiner.daily_digcoin } : null,
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1910,6 +2081,7 @@ app.get('/api/stats', async (req, res) => {
         const { count: aliveMiners } = await supabase.from('miners').select('*', { count: 'exact', head: true }).eq('is_alive', true);
         const { count: landsMinted } = await supabase.from('lands').select('*', { count: 'exact', head: true });
         const { count: autoPickaxesMinted } = await supabase.from('player_perks').select('*', { count: 'exact', head: true }).eq('perk_type', 'auto_pickaxe');
+        const { count: s2BoxesMinted } = await supabase.from('box_purchases').select('*', { count: 'exact', head: true }).eq('box_type', 's2');
         const [{ data: agg }, { data: dungeonPool }, { data: recentWins }, { data: totalPaidRow }] = await Promise.all([
             supabase.rpc('get_global_stats'),
             supabase.from('dungeon_pool').select('balance_digcoin').eq('id', 1).single(),
@@ -1924,6 +2096,9 @@ app.get('/api/stats', async (req, res) => {
             landMaxSupply: CONFIG.LAND_BOX_MAX_SUPPLY,
             autoPickaxesMinted: autoPickaxesMinted || 0,
             autoPickaxeMaxSupply: CONFIG.AUTO_PICKAXE_MAX_SUPPLY,
+            s2BoxesMinted: s2BoxesMinted || 0,
+            s2BoxMaxSupply: CONFIG.S2_BOX_MAX_SUPPLY,
+            s2LaunchAtMs: S2_LAUNCH_AT_MS,
             dungeonPoolBalance: dungeonPool?.balance_digcoin || 0,
             dungeonTotalPaid,
             dungeonRecentWins: (recentWins || []).map(r => ({
@@ -2002,6 +2177,9 @@ async function runAutoPickaxeWorker() {
 // Run once at startup (catch up any missed cycles), then every hour
 setTimeout(runAutoPickaxeWorker, 30_000);
 setInterval(runAutoPickaxeWorker, 60 * 60 * 1000);
+
+// Init S2 launch time from DB (set once, never reset on restart)
+initS2LaunchTime();
 
 // ════════════════════════════════════════════
 // START
