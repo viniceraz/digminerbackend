@@ -1162,10 +1162,19 @@ app.get('/api/player/:wallet', async (req, res) => {
         const w = norm(raw);
         const { data: player } = await supabase.from('players').select('*').eq('wallet', w).single();
         if (!player) return res.status(404).json({ error: 'Player not found' });
-        const [{ data: miners }, { data: perkData }] = await Promise.all([
+        const [{ data: miners }, { data: perkData }, { data: boxSpend }, { data: landSpend }, { data: repairSpend }, { data: actSpend }] = await Promise.all([
             supabase.from('miners').select('*').eq('wallet', w).order('created_at', { ascending: false }),
             supabase.from('player_perks').select('active').eq('wallet', w).eq('perk_type', 'auto_pickaxe').maybeSingle(),
+            supabase.from('box_purchases').select('cost_digcoin').eq('wallet', w),
+            supabase.from('land_purchases').select('cost_digcoin').eq('wallet', w),
+            supabase.from('repairs').select('cost_digcoin').eq('wallet', w),
+            supabase.from('activity_log').select('amount_digcoin').eq('wallet', w),
         ]);
+        const totalSpentDigcoin =
+            (boxSpend    || []).reduce((s, r) => s + (r.cost_digcoin   || 0), 0) +
+            (landSpend   || []).reduce((s, r) => s + (r.cost_digcoin   || 0), 0) +
+            (repairSpend || []).reduce((s, r) => s + (r.cost_digcoin   || 0), 0) +
+            (actSpend    || []).reduce((s, r) => s + (r.amount_digcoin || 0), 0);
 
         const now = Date.now();
         const WEREMOLE_RARITY_FALLBACK = { repairPathUSD: 0, maxHp: 100, color: '#8B4513' };
@@ -1211,6 +1220,7 @@ app.get('/api/player/:wallet', async (req, res) => {
                 totalDepositedPathUSD: player.total_deposited_pathusd,
                 totalWithdrawnPathUSD: player.total_withdrawn_pathusd,
                 totalEarnedDigcoin: player.total_earned_digcoin,
+                totalSpentDigcoin: Math.round(totalSpentDigcoin),
                 boxesBought: player.boxes_bought,
                 referralLink: `${req.protocol}://${req.get('host')}?ref=${w}`,
                 referralEarnings: player.referral_earnings, referrer: player.referrer,
