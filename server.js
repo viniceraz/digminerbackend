@@ -96,8 +96,8 @@ const CONFIG = {
 
     DUNGEON_COOLDOWN_MS: 20 * 1000, // 20 seconds between dungeon runs
     DUNGEONS: {
-        easy:     { name: 'Goblins',     mapItem: 'map_easy',     mapCost: 50,  prize: 80,  winChance: 0.45, hpLoss: 25, boxDropChance: 0.02 },
-        medium:   { name: 'Spiders',     mapItem: 'map_medium',   mapCost: 150, prize: 280, winChance: 0.40, hpLoss: 40, boxDropChance: 0.05 },
+        easy:     { name: 'Goblins',     mapItem: 'map_easy',     mapCost: 50,  prize: 100, winChance: 0.45, hpLoss: 25, boxDropChance: 0.02 },
+        medium:   { name: 'Spiders',     mapItem: 'map_medium',   mapCost: 150, prize: 300, winChance: 0.40, hpLoss: 40, boxDropChance: 0.05 },
         hard:     { name: "Miner's Bane",mapItem: 'map_hard',     mapCost: 400, prize: 900, winChance: 0.35, hpLoss: 60, boxDropChance: 0.10 },
         weremole: { name: 'Weremole Lair',mapItem: 'map_weremole', mapCost: 400, prize: 0,   winChance: 0.10, hpLoss: 30, boxDropChance: 0, weremoleDungeon: true },
     },
