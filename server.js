@@ -1669,15 +1669,6 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
         if (miner.needs_repair) return res.status(400).json({ error: 'Miner needs repair before entering dungeon' });
         if (miner.last_play_at) return res.status(400).json({ error: 'Miner is currently mining. Claim first.' });
 
-        // Weremole dungeon requires at least one idle miner (besides the one being sent)
-        if (dungeon.weremoleDungeon) {
-            const { data: idleMiners } = await supabase.from('miners')
-                .select('id').eq('wallet', w).eq('is_alive', true).eq('needs_repair', false).is('last_play_at', null);
-            const idleOthers = (idleMiners || []).filter(m => m.id !== mid);
-            if (idleOthers.length === 0) {
-                return res.status(400).json({ error: 'Weremole Lair requires at least one other idle miner to watch the base.' });
-            }
-        }
 
         const mapQty = invRow?.quantity || 0;
         if (mapQty < 1) return res.status(400).json({ error: `No ${dungeon.name} maps in inventory. Buy maps first.` });
