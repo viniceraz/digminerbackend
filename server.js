@@ -1668,6 +1668,7 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
         if (!miner.is_alive) return res.status(400).json({ error: 'Miner is dead' });
         if (miner.needs_repair) return res.status(400).json({ error: 'Miner needs repair before entering dungeon' });
         if (miner.last_play_at) return res.status(400).json({ error: 'Miner is currently mining. Claim first.' });
+        if (dungeon.weremoleDungeon && miner.season !== 2) return res.status(400).json({ error: 'Only Season 2 miners can enter the Weremole Lair.' });
 
 
         const mapQty = invRow?.quantity || 0;
