@@ -716,7 +716,7 @@ async function getLands(wallet) {
     const landIds = lands.map(l => l.id);
     const { data: assignments } = await supabase
         .from('land_miners')
-        .select('land_id, miner_id, miners(id, rarity_id, rarity_name, daily_digcoin, last_play_at, is_alive, needs_repair)')
+        .select('land_id, miner_id, miners(id, rarity_id, rarity_name, daily_digcoin, last_play_at, is_alive, needs_repair, season)')
         .in('land_id', landIds);
 
     const assignmentsByLand = {};
@@ -742,6 +742,7 @@ async function getLands(wallet) {
                         isIdle: !m?.last_play_at,
                         isAlive: m?.is_alive,
                         needsRepair: m?.needs_repair,
+                        season: m?.season ?? 1,
                     };
                 }),
             };
@@ -1614,7 +1615,7 @@ app.post('/api/dungeon/buy-map', financialLimit, checkMaintenance, requireAuth, 
         }
         const w = norm(wallet);
         const mapDef = CONFIG.DUNGEON_MAPS[mapType];
-        if (!mapDef) return res.status(400).json({ error: 'Invalid map type. Use: map_easy, map_medium, map_hard' });
+        if (!mapDef) return res.status(400).json({ error: 'Invalid map type. Use: map_easy, map_medium, map_hard, map_weremole' });
         const qty = parseInt(quantity);
         if (isNaN(qty) || qty < 1 || qty > 50) return res.status(400).json({ error: 'Quantity must be between 1 and 50' });
 
@@ -1826,7 +1827,7 @@ app.get('/api/dungeon/inventory', requireAuth, async (req, res) => {
             supabase.from('dungeon_runs').select('*').eq('wallet', w).order('created_at', { ascending: false }).limit(100),
         ]);
 
-        const maps = { map_easy: 0, map_medium: 0, map_hard: 0 };
+        const maps = { map_easy: 0, map_medium: 0, map_hard: 0, map_weremole: 0 };
         (inv || []).forEach(i => { if (maps.hasOwnProperty(i.item_type)) maps[i.item_type] = i.quantity; });
 
         res.json({ maps, recentRuns: runs || [] });
