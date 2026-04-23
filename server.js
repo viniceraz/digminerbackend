@@ -80,6 +80,8 @@ const CONFIG = {
     CHAIN_ID: parseInt(process.env.CHAIN_ID || '1'),
 
     ADMIN_WALLET: (process.env.ADMIN_WALLET || '').toLowerCase(),
+    MARKETPLACE_FEE_PERCENT: 10,
+    MARKETPLACE_FEE_WALLET: '0x8174db20bdc835c35f70a0a536c019c89c783d8c',
     DIGCOIN_PER_PATHUSD: 100,
     BOX_PRICE_DIGCOIN: 300,        // 3 pathUSD
     BOX_BULK_QUANTITY: 10,
@@ -762,6 +764,9 @@ async function assignMinerToLand(wallet, landId, minerId) {
     if (!miner) return { error: 'Miner not found' };
     if (!miner.is_alive || miner.needs_repair) return { error: 'Miner must be alive to assign to a land' };
     if (miner.last_play_at) return { error: 'Miner must be IDLE to assign to a land. Claim or wait for mining to finish.' };
+
+    const { data: activeListing } = await supabase.from('land_listings').select('id').eq('land_id', landId).eq('status', 'active').maybeSingle();
+    if (activeListing) return { error: 'Cannot assign miners to a land listed for sale. Cancel the listing first.' };
 
     // Atomic: slot count check + insert in one DB transaction (prevents TOCTOU overflow)
     const { data: rpcResult, error: rpcErr } = await supabase.rpc('assign_miner_to_land', {
@@ -1837,6 +1842,136 @@ app.get('/api/dungeon/inventory', requireAuth, async (req, res) => {
 });
 
 // ════════════════════════════════════════════
+// MARKETPLACE
+// ════════════════════════════════════════════
+
+// GET /api/marketplace/listings?rarity=&sort=asc|desc
+app.get('/api/marketplace/listings', async (req, res) => {
+    try {
+        const { rarity, sort } = req.query;
+        const { data, error } = await supabase
+            .from('land_listings')
+            .select('*, lands(id, rarity_id, rarity_name, boost_percent, miner_slots, wallet)')
+            .eq('status', 'active')
+            .order('price_digcoin', { ascending: sort !== 'desc' });
+        if (error) throw error;
+        let listings = (data || []).map(l => ({
+            id: l.id,
+            landId: l.land_id,
+            seller: l.seller_wallet,
+            priceDigcoin: l.price_digcoin,
+            rarityId: l.lands?.rarity_id,
+            rarityName: l.lands?.rarity_name,
+            boostPercent: l.lands?.boost_percent,
+            minerSlots: l.lands?.miner_slots,
+            listedAt: l.created_at,
+        }));
+        // Filter by rarity in-memory (rarity_id lives on lands, not land_listings)
+        if (rarity !== undefined && rarity !== '') {
+            const rid = parseInt(rarity);
+            listings = listings.filter(l => l.rarityId === rid);
+        }
+        res.json({ listings });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/marketplace/list — list a land for sale
+app.post('/api/marketplace/list', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
+    try {
+        const { wallet, landId, priceDigcoin } = req.body;
+        const w = norm(wallet);
+        if (!landId || !priceDigcoin || priceDigcoin < 1) return res.status(400).json({ error: 'Invalid land or price.' });
+
+        // Verify land belongs to seller
+        const { data: land } = await supabase.from('lands').select('*').eq('id', landId).eq('wallet', w).single();
+        if (!land) return res.status(404).json({ error: 'Land not found or not yours.' });
+
+        // Block if miners assigned
+        const { count: assignedCount } = await supabase.from('land_miners').select('*', { count: 'exact', head: true }).eq('land_id', landId);
+        if (assignedCount > 0) return res.status(400).json({ error: 'Unassign all miners before listing.' });
+
+        // Block if already listed
+        const { data: existing } = await supabase.from('land_listings').select('id').eq('land_id', landId).eq('status', 'active').maybeSingle();
+        if (existing) return res.status(400).json({ error: 'Land is already listed.' });
+
+        const { data: listing, error } = await supabase.from('land_listings').insert({
+            land_id: landId,
+            seller_wallet: w,
+            price_digcoin: Math.round(priceDigcoin),
+            status: 'active',
+        }).select().single();
+        if (error) throw error;
+
+        res.json({ success: true, listing });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /api/marketplace/cancel/:id — cancel listing
+app.delete('/api/marketplace/cancel/:id', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
+    try {
+        const { wallet } = req.body;
+        const w = norm(wallet);
+        const { data: listing } = await supabase.from('land_listings').select('*').eq('id', req.params.id).eq('status', 'active').single();
+        if (!listing) return res.status(404).json({ error: 'Listing not found.' });
+        if (listing.seller_wallet !== w) return res.status(403).json({ error: 'Not your listing.' });
+
+        await supabase.from('land_listings').update({ status: 'cancelled' }).eq('id', listing.id);
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/marketplace/buy/:id — buy a land
+app.post('/api/marketplace/buy/:id', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
+    try {
+        const { wallet } = req.body;
+        const w = norm(wallet);
+
+        const { data: listing } = await supabase.from('land_listings').select('*, lands(*)').eq('id', req.params.id).eq('status', 'active').single();
+        if (!listing) return res.status(404).json({ error: 'Listing not found or already sold.' });
+        if (listing.seller_wallet === w) return res.status(400).json({ error: 'Cannot buy your own listing.' });
+
+        const price = listing.price_digcoin;
+        const fee = Math.round(price * CONFIG.MARKETPLACE_FEE_PERCENT / 100);
+        const sellerReceives = price - fee;
+
+        // Check buyer balance
+        const { data: buyer } = await supabase.from('players').select('digcoin_balance').eq('wallet', w).single();
+        if (!buyer || buyer.digcoin_balance < price) return res.status(400).json({ error: `Insufficient balance. Need ${price} DC.` });
+
+        // Ensure fee wallet has a player row (deploy wallet may not be registered)
+        await getOrCreatePlayer(CONFIG.MARKETPLACE_FEE_WALLET);
+
+        // Deduct from buyer
+        const { data: deducted } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: price });
+        if (!deducted) return res.status(400).json({ error: 'Failed to deduct balance.' });
+
+        // Credit seller (90%) + fee wallet (10%) — log errors but don't block
+        const [sellerRes, feeRes] = await Promise.all([
+            supabase.rpc('add_digcoin', { p_wallet: listing.seller_wallet, p_amount: sellerReceives, p_referral_digcoin: 0 }),
+            supabase.rpc('add_digcoin', { p_wallet: CONFIG.MARKETPLACE_FEE_WALLET, p_amount: fee, p_referral_digcoin: 0 }),
+        ]);
+        if (sellerRes.error) console.error(`❌ marketplace seller credit failed: ${sellerRes.error.message}`);
+        if (feeRes.error)    console.error(`❌ marketplace fee credit failed: ${feeRes.error.message}`);
+
+        // Transfer land ownership + mark sold (atomic via Promise.all)
+        await Promise.all([
+            supabase.from('lands').update({ wallet: w }).eq('id', listing.land_id),
+            supabase.from('land_listings').update({ status: 'sold' }).eq('id', listing.id),
+        ]);
+
+        const rarityName = listing.lands?.rarity_name || 'Land';
+
+        // Log activity
+        await supabase.from('activity_log').insert([
+            { wallet: w,                     type: 'marketplace_buy',  detail: `Bought Land #${listing.land_id} (${rarityName}) for ${price} DC`, amount_digcoin: price },
+            { wallet: listing.seller_wallet,  type: 'marketplace_sell', detail: `Sold Land #${listing.land_id} (${rarityName}) for ${sellerReceives} DC (fee: ${fee} DC)`, amount_digcoin: 0 },
+        ]);
+
+        res.json({ success: true, landId: listing.land_id, price, fee, sellerReceives });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ════════════════════════════════════════════
 // ADMIN ROUTES
 // ════════════════════════════════════════════
 
@@ -2085,13 +2220,15 @@ app.get('/api/stats', async (req, res) => {
         const { count: landsMinted } = await supabase.from('lands').select('*', { count: 'exact', head: true });
         const { count: autoPickaxesMinted } = await supabase.from('player_perks').select('*', { count: 'exact', head: true }).eq('perk_type', 'auto_pickaxe');
         const { count: s2BoxesMinted } = await supabase.from('box_purchases').select('*', { count: 'exact', head: true }).eq('box_type', 's2');
-        const [{ data: agg }, { data: dungeonPool }, { data: recentWins }, { data: totalPaidRow }] = await Promise.all([
+        const [{ data: agg }, { data: dungeonPool }, { data: recentWins }, { data: totalPaidRow }, { data: mktSold }] = await Promise.all([
             supabase.rpc('get_global_stats'),
             supabase.from('dungeon_pool').select('balance_digcoin').eq('id', 1).single(),
             supabase.from('dungeon_runs').select('wallet,dungeon_type,reward_digcoin,created_at').eq('result', 'win').order('created_at', { ascending: false }).limit(5),
             supabase.from('dungeon_runs').select('reward_digcoin').eq('result', 'win'),
+            supabase.from('land_listings').select('price_digcoin').eq('status', 'sold'),
         ]);
         const dungeonTotalPaid = (totalPaidRow || []).reduce((s, r) => s + (parseFloat(r.reward_digcoin) || 0), 0);
+        const marketplaceVolume = (mktSold || []).reduce((s, r) => s + (r.price_digcoin || 0), 0);
         res.json({
             totalPlayers, totalMiners, aliveMiners, ...(agg?.[0] || {}),
             landSaleStartMs: LAND_SALE_START_MS,
@@ -2104,6 +2241,8 @@ app.get('/api/stats', async (req, res) => {
             s2LaunchAtMs: S2_LAUNCH_AT_MS,
             dungeonPoolBalance: dungeonPool?.balance_digcoin || 0,
             dungeonTotalPaid,
+            marketplaceVolume,
+            marketplaceSales: mktSold?.length || 0,
             dungeonRecentWins: (recentWins || []).map(r => ({
                 wallet: r.wallet.slice(0, 6) + '...' + r.wallet.slice(-4),
                 dungeonType: r.dungeon_type,
