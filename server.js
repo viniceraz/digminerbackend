@@ -82,6 +82,12 @@ const CONFIG = {
     ADMIN_WALLET: (process.env.ADMIN_WALLET || '').toLowerCase(),
     MARKETPLACE_FEE_PERCENT: 10,
     MARKETPLACE_FEE_WALLET: '0x8174db20bdc835c35f70a0a536c019c89c783d8c',
+    STAKE_TIERS: [
+        { lockDays: 15, apy: 50  },
+        { lockDays: 30, apy: 120 },
+        { lockDays: 90, apy: 300 },
+    ],
+    STAKE_MIN_AMOUNT: 100, // minimum DC to stake
     DIGCOIN_PER_PATHUSD: 100,
     BOX_PRICE_DIGCOIN: 300,        // 3 pathUSD
     BOX_BULK_QUANTITY: 10,
@@ -1968,6 +1974,137 @@ app.post('/api/marketplace/buy/:id', financialLimit, checkMaintenance, requireAu
         ]);
 
         res.json({ success: true, landId: listing.land_id, price, fee, sellerReceives });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ════════════════════════════════════════════
+// STAKING
+// ════════════════════════════════════════════
+
+function calcPendingRewards(stake) {
+    const now = Date.now();
+    const lastClaim = new Date(stake.last_reward_at).getTime();
+    const elapsed = Math.max(0, now - lastClaim); // ms
+    const dailyRate = stake.apy_percent / 100 / 365;
+    return stake.amount_digcoin * dailyRate * (elapsed / 86400000);
+}
+
+// GET /api/stake/leaderboard
+app.get('/api/stake/leaderboard', async (req, res) => {
+    try {
+        const { data } = await supabase.from('stakes').select('wallet, amount_digcoin, apy_percent, lock_days, started_at').eq('status', 'active').order('amount_digcoin', { ascending: false }).limit(20);
+        const grouped = {};
+        for (const s of data || []) {
+            if (!grouped[s.wallet]) grouped[s.wallet] = 0;
+            grouped[s.wallet] += s.amount_digcoin;
+        }
+        const leaderboard = Object.entries(grouped)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 20)
+            .map(([wallet, total], i) => ({
+                rank: i + 1,
+                wallet: wallet.slice(0, 6) + '...' + wallet.slice(-4),
+                totalStaked: total,
+                points: total, // 1 DC staked = 1 point
+            }));
+        res.json({ leaderboard });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/stake/:wallet
+app.get('/api/stake/:wallet', async (req, res) => {
+    try {
+        const w = norm(req.params.wallet);
+        const { data: stakes } = await supabase.from('stakes').select('*').eq('wallet', w).eq('status', 'active').order('started_at', { ascending: false });
+        const result = (stakes || []).map(s => ({
+            id: s.id,
+            amountDigcoin: s.amount_digcoin,
+            lockDays: s.lock_days,
+            apyPercent: s.apy_percent,
+            startedAt: s.started_at,
+            unlocksAt: s.unlocks_at,
+            lastRewardAt: s.last_reward_at,
+            pendingRewards: parseFloat(calcPendingRewards(s).toFixed(4)),
+            unlocked: new Date(s.unlocks_at).getTime() <= Date.now(),
+            points: s.amount_digcoin, // 1 DC staked = 1 point
+        }));
+        const totalPoints = result.reduce((s, x) => s + x.points, 0);
+        res.json({ stakes: result, totalPoints });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/stake/deposit
+app.post('/api/stake/deposit', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
+    try {
+        const { wallet, amountDigcoin } = req.body;
+        const lockDays = parseInt(req.body.lockDays);
+        const w = norm(wallet);
+        const tier = CONFIG.STAKE_TIERS.find(t => t.lockDays === lockDays);
+        if (!tier) return res.status(400).json({ error: 'Invalid lock period. Choose 15, 30, or 90 days.' });
+        const amount = Math.floor(amountDigcoin);
+        if (!amount || amount < CONFIG.STAKE_MIN_AMOUNT) return res.status(400).json({ error: `Minimum stake is ${CONFIG.STAKE_MIN_AMOUNT} DC.` });
+
+        const { data: player } = await supabase.from('players').select('digcoin_balance').eq('wallet', w).single();
+        if (!player || player.digcoin_balance < amount) return res.status(400).json({ error: `Insufficient balance. Need ${amount} DC.` });
+
+        const { data: ok } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: amount });
+        if (!ok) return res.status(400).json({ error: 'Failed to lock balance.' });
+
+        const unlocksAt = new Date(Date.now() + lockDays * 86400000).toISOString();
+        const { data: stake, error } = await supabase.from('stakes').insert({
+            wallet: w, amount_digcoin: amount, lock_days: lockDays,
+            apy_percent: tier.apy, unlocks_at: unlocksAt, last_reward_at: new Date().toISOString(),
+            status: 'active',
+        }).select().single();
+        if (error) throw error;
+
+        console.log(`💎 Stake: ${w.slice(0,8)} locked ${amount} DC for ${lockDays}d @ ${tier.apy}% APY`);
+        res.json({ success: true, stake: { id: stake.id, amountDigcoin: amount, lockDays, apyPercent: tier.apy, unlocksAt } });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/stake/claim/:id — collect accumulated rewards
+app.post('/api/stake/claim/:id', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
+    try {
+        const { wallet } = req.body;
+        const w = norm(wallet);
+        const { data: stake } = await supabase.from('stakes').select('*').eq('id', req.params.id).eq('wallet', w).eq('status', 'active').single();
+        if (!stake) return res.status(404).json({ error: 'Stake not found.' });
+
+        const rewards = calcPendingRewards(stake);
+        if (rewards < 0.01) return res.status(400).json({ error: 'No rewards to claim yet.' });
+
+        const rewardRounded = parseFloat(rewards.toFixed(2));
+        await Promise.all([
+            supabase.rpc('add_digcoin', { p_wallet: w, p_amount: rewardRounded, p_referral_digcoin: 0 }),
+            supabase.from('stakes').update({ last_reward_at: new Date().toISOString() }).eq('id', stake.id),
+        ]);
+
+        await supabase.from('activity_log').insert({ wallet: w, type: 'stake_reward', detail: `Stake #${stake.id} reward: +${rewardRounded} DC (${stake.apy_percent}% APY, ${stake.lock_days}d lock)`, amount_digcoin: 0 });
+        res.json({ success: true, rewardClaimed: rewardRounded });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/stake/withdraw/:id — unstake after lock expires
+app.post('/api/stake/withdraw/:id', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
+    try {
+        const { wallet } = req.body;
+        const w = norm(wallet);
+        const { data: stake } = await supabase.from('stakes').select('*').eq('id', req.params.id).eq('wallet', w).eq('status', 'active').single();
+        if (!stake) return res.status(404).json({ error: 'Stake not found.' });
+        if (new Date(stake.unlocks_at).getTime() > Date.now()) return res.status(400).json({ error: `Still locked. Unlocks at ${new Date(stake.unlocks_at).toUTCString()}.` });
+
+        // Claim any remaining rewards first
+        const pending = calcPendingRewards(stake);
+        const pendingRounded = parseFloat(pending.toFixed(2));
+
+        await Promise.all([
+            supabase.rpc('add_digcoin', { p_wallet: w, p_amount: stake.amount_digcoin + pendingRounded, p_referral_digcoin: 0 }),
+            supabase.from('stakes').update({ status: 'withdrawn' }).eq('id', stake.id),
+        ]);
+
+        await supabase.from('activity_log').insert({ wallet: w, type: 'stake_withdraw', detail: `Stake #${stake.id} withdrawn: ${stake.amount_digcoin} DC + ${pendingRounded} DC rewards`, amount_digcoin: 0 });
+        res.json({ success: true, principalReturned: stake.amount_digcoin, rewardClaimed: pendingRounded, total: stake.amount_digcoin + pendingRounded });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
