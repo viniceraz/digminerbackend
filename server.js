@@ -1962,7 +1962,7 @@ app.post('/api/marketplace/buy/:id', financialLimit, checkMaintenance, requireAu
         // Transfer land ownership + mark sold (atomic via Promise.all)
         await Promise.all([
             supabase.from('lands').update({ wallet: w }).eq('id', listing.land_id),
-            supabase.from('land_listings').update({ status: 'sold' }).eq('id', listing.id),
+            supabase.from('land_listings').update({ status: 'sold', buyer_wallet: w }).eq('id', listing.id),
         ]);
 
         const rarityName = listing.lands?.rarity_name || 'Land';
@@ -1988,6 +1988,30 @@ function calcPendingRewards(stake) {
     const dailyRate = stake.apy_percent / 100 / 365;
     return stake.amount_digcoin * dailyRate * (elapsed / 86400000);
 }
+
+// GET /api/marketplace/history
+app.get('/api/marketplace/history', async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('land_listings')
+            .select('id, land_id, seller_wallet, buyer_wallet, price_digcoin, created_at, lands(rarity_id, rarity_name)')
+            .eq('status', 'sold')
+            .order('created_at', { ascending: false })
+            .limit(50);
+        if (error) throw error;
+        const history = (data || []).map(l => ({
+            id: l.id,
+            landId: l.land_id,
+            rarityId: l.lands?.rarity_id,
+            rarityName: l.lands?.rarity_name || 'Land',
+            priceDigcoin: l.price_digcoin,
+            seller: l.seller_wallet ? l.seller_wallet.slice(0,6)+'...'+l.seller_wallet.slice(-4) : '—',
+            buyer: l.buyer_wallet ? l.buyer_wallet.slice(0,6)+'...'+l.buyer_wallet.slice(-4) : '—',
+            soldAt: l.created_at,
+        }));
+        res.json({ history });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 // GET /api/stake/leaderboard
 app.get('/api/stake/leaderboard', async (req, res) => {
