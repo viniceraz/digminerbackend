@@ -80,7 +80,7 @@ const CONFIG = {
     CHAIN_ID: parseInt(process.env.CHAIN_ID || '1'),
 
     ADMIN_WALLET: (process.env.ADMIN_WALLET || '').toLowerCase(),
-    THIEFCAT: { rarityId: 'thiefcat', rarityName: 'ThiefCat', daily: 30, nftAge: 7, repairPathUSD: 0.30, maxHp: 100, season: 4 },
+    THIEFCAT: { rarityId: 6, rarityName: 'ThiefCat', daily: 30, nftAge: 7, repairPathUSD: 0.30, maxHp: 100, season: 4 },
     MARKETPLACE_FEE_PERCENT: 10,
     MARKETPLACE_FEE_WALLET: '0x8174db20bdc835c35f70a0a536c019c89c783d8c',
     S2_DUNGEON_BUFFS: {
@@ -1759,7 +1759,7 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
                 // Prize is a permanent Weremole miner (season=3), no DC awarded
                 const { data: newWeremole } = await supabase.from('miners').insert({
                     wallet: w,
-                    rarity_id: 'weremole',
+                    rarity_id: 7,
                     rarity_name: 'Weremole',
                     daily_digcoin: 30,
                     nft_age_total: 9999,
