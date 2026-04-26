@@ -80,6 +80,7 @@ const CONFIG = {
     CHAIN_ID: parseInt(process.env.CHAIN_ID || '1'),
 
     ADMIN_WALLET: (process.env.ADMIN_WALLET || '').toLowerCase(),
+    THIEFCAT: { rarityId: 'thiefcat', rarityName: 'ThiefCat', daily: 30, nftAge: 7, repairPathUSD: 0.30, maxHp: 100, season: 4 },
     MARKETPLACE_FEE_PERCENT: 10,
     MARKETPLACE_FEE_WALLET: '0x8174db20bdc835c35f70a0a536c019c89c783d8c',
     S2_DUNGEON_BUFFS: {
@@ -576,6 +577,8 @@ async function fuseMiner(wallet, minerId1, minerId2) {
     if (m2.season === 2) return { error: `Miner #${minerId2} is a Season 2 miner and cannot be fused.` };
     if (m1.season === 3) return { error: `Miner #${minerId1} is a Weremole and cannot be fused.` };
     if (m2.season === 3) return { error: `Miner #${minerId2} is a Weremole and cannot be fused.` };
+    if (m1.season === 4) return { error: `Miner #${minerId1} is a ThiefCat and cannot be fused.` };
+    if (m2.season === 4) return { error: `Miner #${minerId2} is a ThiefCat and cannot be fused.` };
 
     // Cannot fuse already-fused miners
     if (m1.is_fused) return { error: `Miner #${minerId1} is already a Fused miner and cannot be fused again.` };
@@ -1197,8 +1200,9 @@ app.get('/api/player/:wallet', async (req, res) => {
 
         const now = Date.now();
         const WEREMOLE_RARITY_FALLBACK = { repairPathUSD: 0, maxHp: 100, color: '#8B4513' };
+        const THIEFCAT_RARITY = { repairPathUSD: 0.30, maxHp: 100, color: '#FF6B35' };
         const mapped = (miners || []).map(m => {
-            const rarity = m.season === 3 ? WEREMOLE_RARITY_FALLBACK : (CONFIG.RARITIES[m.rarity_id] || CONFIG.S2_RARITIES[m.rarity_id] || WEREMOLE_RARITY_FALLBACK);
+            const rarity = m.season === 4 ? THIEFCAT_RARITY : m.season === 3 ? WEREMOLE_RARITY_FALLBACK : (CONFIG.RARITIES[m.rarity_id] || CONFIG.S2_RARITIES[m.rarity_id] || WEREMOLE_RARITY_FALLBACK);
             const healthy = m.is_alive && !m.needs_repair;
             let isIdle = false, isMining = false, canClaim = false, cooldownRemaining = 0;
             if (healthy) {
@@ -2351,6 +2355,48 @@ app.get('/api/admin/players', requireAdmin, async (req, res) => {
             .order('digcoin_balance', { ascending: false })
             .limit(100);
         res.json({ players: players || [] });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/admin/airdrop-thiefcat — send ThiefCat miners to affected wallets
+app.post('/api/admin/airdrop-thiefcat', requireAdmin, async (req, res) => {
+    try {
+        const { wallets } = req.body;
+        if (!Array.isArray(wallets) || wallets.length === 0) return res.status(400).json({ error: 'wallets array required' });
+        if (wallets.length > 100) return res.status(400).json({ error: 'Max 100 wallets per batch' });
+
+        const tc = CONFIG.THIEFCAT;
+        const results = { success: [], failed: [] };
+
+        for (const raw of wallets) {
+            if (!isValidAddress(raw)) { results.failed.push({ wallet: raw, error: 'Invalid address' }); continue; }
+            const w = norm(raw);
+            try {
+                await getOrCreatePlayer(w);
+                const { data: miner, error } = await supabase.from('miners').insert({
+                    wallet: w,
+                    rarity_id: tc.rarityId,
+                    rarity_name: tc.rarityName,
+                    daily_digcoin: tc.daily,
+                    nft_age_total: tc.nftAge,
+                    nft_age_remaining: tc.nftAge,
+                    hp: tc.maxHp,
+                    max_hp: tc.maxHp,
+                    season: tc.season,
+                    is_alive: true,
+                    needs_repair: false,
+                    level: 1, exp: 0, power: 100, energy: 100, protective: 100, damage: 20,
+                }).select().single();
+                if (error) throw new Error(error.message);
+                await supabase.from('activity_log').insert({ wallet: w, type: 'thiefcat_airdrop', detail: `ThiefCat airdrop — Miner #${miner.id} (FarmCats rug compensation)`, amount_digcoin: 0 });
+                results.success.push({ wallet: w, minerId: miner.id });
+                console.log(`🐱 ThiefCat airdrop → ${w} (Miner #${miner.id})`);
+            } catch (e) {
+                results.failed.push({ wallet: w, error: e.message });
+            }
+        }
+
+        res.json({ success: true, sent: results.success.length, failed: results.failed.length, results });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
