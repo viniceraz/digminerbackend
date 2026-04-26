@@ -115,13 +115,13 @@ const CONFIG = {
         easy:     { name: 'Goblins',     mapItem: 'map_easy',     mapCost: 50,  prize: 100, winChance: 0.45, hpLoss: 25, boxDropChance: 0.02 },
         medium:   { name: 'Spiders',     mapItem: 'map_medium',   mapCost: 150, prize: 300, winChance: 0.40, hpLoss: 40, boxDropChance: 0.05 },
         hard:     { name: "Miner's Bane",mapItem: 'map_hard',     mapCost: 400, prize: 900, winChance: 0.35, hpLoss: 60, boxDropChance: 0.10 },
-        weremole: { name: 'Weremole Lair',mapItem: 'map_weremole', mapCost: 400, prize: 0,   winChance: 0.10, hpLoss: 30, boxDropChance: 0, weremoleDungeon: true },
+        weremole: { name: 'Weremole Lair',mapItem: 'map_weremole', mapCost: 200, prize: 0,   winChance: 0.10, hpLoss: 30, boxDropChance: 0, weremoleDungeon: true },
     },
     DUNGEON_MAPS: {
         map_easy:     { name: 'Goblin Map',        price: 50,  dungeonType: 'easy'     },
         map_medium:   { name: 'Spider Map',        price: 150, dungeonType: 'medium'   },
         map_hard:     { name: "Miner's Bane Map",  price: 400, dungeonType: 'hard'     },
-        map_weremole: { name: 'Weremole Map',      price: 400, dungeonType: 'weremole' },
+        map_weremole: { name: 'Weremole Map',      price: 200, dungeonType: 'weremole' },
     },
     AUTO_PICKAXE_PRICE: 3000,     // one-time lifetime purchase
     AUTO_PICKAXE_MAX_SUPPLY: 500, // hard cap
