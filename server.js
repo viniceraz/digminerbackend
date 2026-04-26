@@ -82,6 +82,14 @@ const CONFIG = {
     ADMIN_WALLET: (process.env.ADMIN_WALLET || '').toLowerCase(),
     MARKETPLACE_FEE_PERCENT: 10,
     MARKETPLACE_FEE_WALLET: '0x8174db20bdc835c35f70a0a536c019c89c783d8c',
+    S2_DUNGEON_BUFFS: {
+        0: { name: 'Resilient',  hpReduction: 0.25 },                                                          // Common:     -25% HP lost
+        1: { name: 'Swift',      cooldownMs: 10 * 1000 },                                                      // UnCommon:   cooldown 10s
+        2: { name: 'Looter',     boxMultiplier: 2 },                                                           // Rare:       2x box drop
+        3: { name: 'Lucky',      winBonus: 0.10 },                                                             // Super Rare: +10% win chance
+        4: { name: 'Scavenger',  mapRecovery: 0.15 },                                                         // Legendary:  15% map recovery
+        5: { name: 'Dominator',  winBonus: 0.10, mapRecovery: 0.15, boxMultiplier: 2 },                      // Mythic:     all profit buffs
+    },
     STAKE_TIERS: [
         { lockDays: 15, apy: 50  },
         { lockDays: 30, apy: 120 },
@@ -1726,7 +1734,10 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
             }
         }
 
-        const finalWinChance = dungeon.winChance;
+        // S2 dungeon buffs
+        const s2Buff = miner.season === 2 ? (CONFIG.S2_DUNGEON_BUFFS[miner.rarity_id] || null) : null;
+        const finalWinChance = dungeon.weremoleDungeon ? dungeon.winChance
+            : Math.min(0.95, dungeon.winChance + (s2Buff?.winBonus || 0));
 
         const roll = Math.random();
         const won = roll < finalWinChance;
@@ -1736,6 +1747,7 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
         let hpLost = 0;
         let newHp = miner.hp ?? 100;
         let needsRepair = false;
+        let mapRecovered = false;
 
         let weremoleMiner = null;
         if (won) {
@@ -1763,8 +1775,15 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
                 weremoleMiner = newWeremole;
             } else {
                 rewardDigcoin = dungeon.prize;
+                const effectiveBoxChance = dungeon.boxDropChance * (s2Buff?.boxMultiplier || 1);
                 const boxRoll = Math.random();
-                boxDropped = boxRoll < dungeon.boxDropChance;
+                boxDropped = boxRoll < effectiveBoxChance;
+
+                // Legendary/Mythic: chance to recover map
+                if (s2Buff?.mapRecovery && Math.random() < s2Buff.mapRecovery) {
+                    await supabase.rpc('add_inventory_item', { p_wallet: w, p_item_type: dungeon.mapItem, p_quantity: 1 });
+                    mapRecovered = true;
+                }
 
                 // Award prize from dungeon pool
                 await supabase.rpc('spend_dungeon_pool', { p_amount: rewardDigcoin });
@@ -1786,7 +1805,10 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
                 }
             }
         } else {
-            hpLost = dungeon.hpLoss;
+            // Common S2 buff: -25% HP lost on defeat
+            hpLost = s2Buff?.hpReduction
+                ? Math.floor(dungeon.hpLoss * (1 - s2Buff.hpReduction))
+                : dungeon.hpLoss;
             // Weremole is permanent — HP floors at 1, never dies or needs repair
             newHp = miner.season === 3
                 ? Math.max(1, (miner.hp ?? 100) - hpLost)
@@ -1794,12 +1816,18 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
             needsRepair = miner.season === 3 ? false : newHp <= 0;
         }
 
+        // UnCommon S2 buff: shorter cooldown — store earlier timestamp
+        const cooldownMs = s2Buff?.cooldownMs ?? CONFIG.DUNGEON_COOLDOWN_MS;
+        const lastDungeonAt = s2Buff?.cooldownMs
+            ? new Date(Date.now() - (CONFIG.DUNGEON_COOLDOWN_MS - s2Buff.cooldownMs)).toISOString()
+            : new Date().toISOString();
+
         // Update miner HP + cooldown
         await supabase.from('miners').update({
             hp: newHp,
             needs_repair: needsRepair,
             is_alive: needsRepair ? false : miner.is_alive,
-            last_dungeon_at: new Date().toISOString(),
+            last_dungeon_at: lastDungeonAt,
             last_dungeon_type: dungeonType,
         }).eq('id', mid);
 
@@ -1824,6 +1852,8 @@ app.post('/api/dungeon/run', financialLimit, checkMaintenance, requireAuth, asyn
             needsRepair,
             finalWinChance: Math.round(finalWinChance * 100),
             weremoleMiner: weremoleMiner ? { id: weremoleMiner.id, dailyDigcoin: weremoleMiner.daily_digcoin } : null,
+            mapRecovered,
+            s2Buff: s2Buff ? s2Buff.name : null,
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
