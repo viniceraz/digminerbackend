@@ -2561,6 +2561,212 @@ setInterval(runAutoPickaxeWorker, 60 * 60 * 1000);
 initS2LaunchTime();
 
 // ════════════════════════════════════════════
+// PVP
+// ════════════════════════════════════════════
+
+const PVP_MIN_STAKE    = 100;
+const PVP_POOL_FEE     = 0.10; // 10% of pot goes to dungeon pool
+const PVP_HP_LOSER     = 30;
+const PVP_HP_WINNER    = 10;
+const PVP_EXPIRE_MS    = 24 * 60 * 60 * 1000;
+
+// POST /api/pvp/challenge — create open challenge
+app.post('/api/pvp/challenge', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
+    try {
+        const { wallet, minerId, stakeDc } = req.body;
+        const w = norm(wallet);
+        if (req.authWallet !== w) return res.status(403).json({ error: 'Forbidden' });
+
+        const stake = parseFloat(stakeDc);
+        if (isNaN(stake) || stake < PVP_MIN_STAKE) return res.status(400).json({ error: `Minimum stake is ${PVP_MIN_STAKE} DC` });
+
+        const { data: miner } = await supabase.from('miners').select('*').eq('id', minerId).eq('wallet', w).single();
+        if (!miner) return res.status(400).json({ error: 'Miner not found' });
+        if (miner.season !== 2) return res.status(400).json({ error: 'Only Season 2 miners can participate in PVP' });
+        if (!miner.is_alive || miner.needs_repair) return res.status(400).json({ error: 'Miner must be alive and repaired' });
+        if (miner.last_play_at) return res.status(400).json({ error: 'Miner is currently mining — claim first' });
+
+        const { data: existing } = await supabase.from('pvp_challenges')
+            .select('id').eq('challenger_miner_id', minerId).eq('status', 'open').limit(1);
+        if (existing?.length) return res.status(400).json({ error: 'This miner already has an open challenge' });
+
+        const { data: player } = await supabase.from('players').select('digcoin_balance').eq('wallet', w).single();
+        if (!player || player.digcoin_balance < stake) return res.status(400).json({ error: 'Insufficient balance' });
+
+        const { data: ok } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: stake });
+        if (!ok) return res.status(400).json({ error: 'Insufficient balance (concurrent conflict — try again)' });
+
+        const { data: challenge, error: cErr } = await supabase.from('pvp_challenges').insert({
+            challenger_wallet: w,
+            challenger_miner_id: minerId,
+            rarity_id: miner.rarity_id,
+            rarity_name: miner.rarity_name,
+            stake_dc: stake,
+            status: 'open',
+            expires_at: new Date(Date.now() + PVP_EXPIRE_MS).toISOString(),
+        }).select().single();
+
+        if (cErr || !challenge) {
+            await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: stake });
+            return res.status(500).json({ error: 'Failed to create challenge' });
+        }
+
+        res.json({ success: true, challenge });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/pvp/accept/:id — accept and resolve battle
+app.post('/api/pvp/accept/:id', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
+    try {
+        const { wallet, minerId } = req.body;
+        const w = norm(wallet);
+        if (req.authWallet !== w) return res.status(403).json({ error: 'Forbidden' });
+        const challengeId = parseInt(req.params.id);
+
+        const { data: challenge } = await supabase.from('pvp_challenges').select('*').eq('id', challengeId).single();
+        if (!challenge) return res.status(400).json({ error: 'Challenge not found' });
+        if (challenge.status !== 'open') return res.status(400).json({ error: 'Challenge is no longer open' });
+        if (challenge.challenger_wallet === w) return res.status(400).json({ error: 'Cannot accept your own challenge' });
+
+        // Expire check — refund challenger if expired
+        if (new Date(challenge.expires_at) < new Date()) {
+            await supabase.from('pvp_challenges').update({ status: 'expired' }).eq('id', challengeId);
+            await supabase.rpc('add_digcoin', { p_wallet: challenge.challenger_wallet, p_amount: challenge.stake_dc });
+            return res.status(400).json({ error: 'Challenge has expired' });
+        }
+
+        const { data: defMiner } = await supabase.from('miners').select('*').eq('id', minerId).eq('wallet', w).single();
+        if (!defMiner) return res.status(400).json({ error: 'Miner not found' });
+        if (defMiner.season !== 2) return res.status(400).json({ error: 'Only Season 2 miners can participate in PVP' });
+        if (defMiner.rarity_id !== challenge.rarity_id) return res.status(400).json({ error: `Must use a ${challenge.rarity_name} miner` });
+        if (!defMiner.is_alive || defMiner.needs_repair) return res.status(400).json({ error: 'Miner must be alive and repaired' });
+        if (defMiner.last_play_at) return res.status(400).json({ error: 'Miner is currently mining — claim first' });
+
+        const { data: player } = await supabase.from('players').select('digcoin_balance').eq('wallet', w).single();
+        if (!player || player.digcoin_balance < challenge.stake_dc) return res.status(400).json({ error: 'Insufficient balance' });
+
+        const { data: ok } = await supabase.rpc('spend_digcoin', { p_wallet: w, p_amount: challenge.stake_dc });
+        if (!ok) return res.status(400).json({ error: 'Insufficient balance (concurrent conflict — try again)' });
+
+        // Atomic claim — locks the challenge so no other acceptor can race in
+        const { data: claimed } = await supabase.from('pvp_challenges')
+            .update({ status: 'in_progress', defender_wallet: w, defender_miner_id: minerId })
+            .eq('id', challengeId).eq('status', 'open').select();
+        if (!claimed || claimed.length === 0) {
+            await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: challenge.stake_dc });
+            return res.status(400).json({ error: 'Challenge was just taken by another player. Try another one.' });
+        }
+
+        const { data: chalMiner } = await supabase.from('miners').select('*').eq('id', challenge.challenger_miner_id).single();
+        if (!chalMiner || !chalMiner.is_alive || chalMiner.needs_repair) {
+            await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: challenge.stake_dc });
+            await supabase.rpc('add_digcoin', { p_wallet: challenge.challenger_wallet, p_amount: challenge.stake_dc });
+            await supabase.from('pvp_challenges').update({ status: 'cancelled' }).eq('id', challengeId);
+            return res.status(400).json({ error: "Challenger's miner is no longer available" });
+        }
+
+        // BATTLE — 50/50
+        const challengerWins = Math.random() < 0.5;
+        const winnerWallet  = challengerWins ? challenge.challenger_wallet : w;
+        const loserWallet   = challengerWins ? w : challenge.challenger_wallet;
+        const winnerMiner   = challengerWins ? chalMiner : defMiner;
+        const loserMiner    = challengerWins ? defMiner : chalMiner;
+
+        const pot        = challenge.stake_dc * 2;
+        const poolFee    = pot * PVP_POOL_FEE;
+        const winnerPrize = pot - poolFee;
+
+        // S2 Resilient buff (-25% HP loss) applies on defeat
+        const loserBuff   = CONFIG.S2_DUNGEON_BUFFS[loserMiner.rarity_id] || null;
+        const loserHpLoss = loserBuff?.hpReduction
+            ? Math.floor(PVP_HP_LOSER * (1 - loserBuff.hpReduction))
+            : PVP_HP_LOSER;
+
+        const winnerNewHp      = Math.max(0, (winnerMiner.hp ?? 100) - PVP_HP_WINNER);
+        const loserNewHp       = Math.max(0, (loserMiner.hp ?? 100) - loserHpLoss);
+        const loserNeedsRepair = loserNewHp <= 0;
+
+        await Promise.all([
+            supabase.rpc('add_digcoin', { p_wallet: winnerWallet, p_amount: winnerPrize }),
+            supabase.rpc('add_dungeon_pool', { p_amount: poolFee }),
+            supabase.from('miners').update({ hp: winnerNewHp }).eq('id', winnerMiner.id),
+            supabase.from('miners').update({
+                hp: loserNewHp,
+                needs_repair: loserNeedsRepair,
+                is_alive: loserNeedsRepair ? false : loserMiner.is_alive,
+            }).eq('id', loserMiner.id),
+            supabase.from('pvp_challenges').update({
+                status: 'completed',
+                winner_wallet: winnerWallet,
+                result: { challengerWins, pot, poolFee, winnerPrize, loserHpLoss, winnerHpLoss: PVP_HP_WINNER },
+            }).eq('id', challengeId),
+        ]);
+
+        res.json({
+            success: true,
+            challengerWins,
+            youWon: winnerWallet === w,
+            winnerWallet,
+            loserWallet,
+            winnerPrize,
+            poolFee,
+            yourNewHp: winnerWallet === w ? winnerNewHp : loserNewHp,
+            yourNeedsRepair: winnerWallet === w ? false : loserNeedsRepair,
+        });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/pvp/open?rarity= — list open challenges
+app.get('/api/pvp/open', async (req, res) => {
+    try {
+        const { rarity } = req.query;
+        let query = supabase.from('pvp_challenges')
+            .select('*, challenger_miner:challenger_miner_id(id, rarity_id, rarity_name, hp, max_hp, daily_digcoin)')
+            .eq('status', 'open')
+            .gt('expires_at', new Date().toISOString())
+            .order('created_at', { ascending: false })
+            .limit(50);
+        if (rarity !== undefined && rarity !== '') query = query.eq('rarity_id', parseInt(rarity));
+        const { data } = await query;
+        res.json({ challenges: data || [] });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/pvp/history/:wallet
+app.get('/api/pvp/history/:wallet', requireAuth, async (req, res) => {
+    try {
+        const w = norm(req.params.wallet);
+        if (req.authWallet !== w) return res.status(403).json({ error: 'Forbidden' });
+        const { data } = await supabase.from('pvp_challenges')
+            .select('*')
+            .or(`challenger_wallet.eq.${w},defender_wallet.eq.${w}`)
+            .order('created_at', { ascending: false })
+            .limit(50);
+        res.json({ history: data || [] });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/pvp/cancel/:id — cancel open challenge and refund
+app.post('/api/pvp/cancel/:id', requireAuth, async (req, res) => {
+    try {
+        const { wallet } = req.body;
+        const w = norm(wallet);
+        if (req.authWallet !== w) return res.status(403).json({ error: 'Forbidden' });
+        const challengeId = parseInt(req.params.id);
+
+        const { data: challenge } = await supabase.from('pvp_challenges').select('*').eq('id', challengeId).single();
+        if (!challenge) return res.status(400).json({ error: 'Challenge not found' });
+        if (challenge.challenger_wallet !== w) return res.status(403).json({ error: 'Not your challenge' });
+        if (challenge.status !== 'open') return res.status(400).json({ error: 'Challenge cannot be cancelled' });
+
+        await supabase.from('pvp_challenges').update({ status: 'cancelled' }).eq('id', challengeId);
+        await supabase.rpc('add_digcoin', { p_wallet: w, p_amount: challenge.stake_dc });
+
+        res.json({ success: true, refunded: challenge.stake_dc });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ════════════════════════════════════════════
 // START
 // ════════════════════════════════════════════
 
