@@ -2573,12 +2573,13 @@ const PVP_EXPIRE_MS    = 24 * 60 * 60 * 1000;
 // POST /api/pvp/challenge — create open challenge
 app.post('/api/pvp/challenge', financialLimit, checkMaintenance, requireAuth, async (req, res) => {
     try {
-        const { wallet, minerId, stakeDc } = req.body;
+        const { wallet, minerId, stakeDc, stakeMiner } = req.body;
         const w = norm(wallet);
         if (req.authWallet !== w) return res.status(403).json({ error: 'Forbidden' });
 
         const stake = parseFloat(stakeDc);
         if (isNaN(stake) || stake < PVP_MIN_STAKE) return res.status(400).json({ error: `Minimum stake is ${PVP_MIN_STAKE} DC` });
+        const minerStaked = stakeMiner === true || stakeMiner === 'true';
 
         const { data: miner } = await supabase.from('miners').select('*').eq('id', minerId).eq('wallet', w).single();
         if (!miner) return res.status(400).json({ error: 'Miner not found' });
@@ -2602,6 +2603,7 @@ app.post('/api/pvp/challenge', financialLimit, checkMaintenance, requireAuth, as
             rarity_id: miner.rarity_id,
             rarity_name: miner.rarity_name,
             stake_dc: stake,
+            stake_miner: minerStaked,
             status: 'open',
             expires_at: new Date(Date.now() + PVP_EXPIRE_MS).toISOString(),
         }).select().single();
@@ -2686,7 +2688,7 @@ app.post('/api/pvp/accept/:id', financialLimit, checkMaintenance, requireAuth, a
         const loserNewHp       = Math.max(0, (loserMiner.hp ?? 100) - loserHpLoss);
         const loserNeedsRepair = loserNewHp <= 0;
 
-        await Promise.all([
+        const ops = [
             supabase.rpc('add_digcoin', { p_wallet: winnerWallet, p_amount: winnerPrize }),
             supabase.rpc('add_dungeon_pool', { p_amount: poolFee }),
             supabase.from('miners').update({ hp: winnerNewHp }).eq('id', winnerMiner.id),
@@ -2698,9 +2700,16 @@ app.post('/api/pvp/accept/:id', financialLimit, checkMaintenance, requireAuth, a
             supabase.from('pvp_challenges').update({
                 status: 'completed',
                 winner_wallet: winnerWallet,
-                result: { challengerWins, pot, poolFee, winnerPrize, loserHpLoss, winnerHpLoss: PVP_HP_WINNER },
+                result: { challengerWins, pot, poolFee, winnerPrize, loserHpLoss, winnerHpLoss: PVP_HP_WINNER, stake_miner: challenge.stake_miner },
             }).eq('id', challengeId),
-        ]);
+        ];
+
+        // Miner stake: transfer loser's miner to winner
+        if (challenge.stake_miner) {
+            ops.push(supabase.from('miners').update({ wallet: winnerWallet }).eq('id', loserMiner.id));
+        }
+
+        await Promise.all(ops);
 
         res.json({
             success: true,
@@ -2712,6 +2721,9 @@ app.post('/api/pvp/accept/:id', financialLimit, checkMaintenance, requireAuth, a
             poolFee,
             yourNewHp: winnerWallet === w ? winnerNewHp : loserNewHp,
             yourNeedsRepair: winnerWallet === w ? false : loserNeedsRepair,
+            minerStaked: challenge.stake_miner,
+            minerWonId: challenge.stake_miner && winnerWallet === w ? loserMiner.id : null,
+            minerLostId: challenge.stake_miner && winnerWallet !== w ? loserMiner.id : null,
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
